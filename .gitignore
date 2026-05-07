@@ -1,0 +1,30 @@
+# Node.js
+node_modules/
+.next/
+out/
+build/
+.env*
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+env/
+venv/
+.pytest_cache/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Project specific
+tmp/
+*.png
+*.pdf
+dummy.mp4
+output.txt
+test_api.py
+pdf_to_img.py
+read_pdf.py
