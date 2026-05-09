@@ -74,7 +74,8 @@ export default function DashboardPage() {
       formData.append("api_key", apiKey);
       formData.append("ng_words", ngWords);
 
-      const apiUrl = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
+      const rawApiUrl = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
+      const apiUrl = rawApiUrl.replace(/\/$/, "");
       const response = await fetch(`${apiUrl}/analyze`, {
         method: "POST",
         body: formData,
