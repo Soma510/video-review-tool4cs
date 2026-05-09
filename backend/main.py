@@ -176,9 +176,14 @@ async def analyze_video(
 ※そのまま外注先にコピペしてLINE等で送れる、完成された文章にしてください。
 """
 
+        from google.genai import types
         response = client.models.generate_content(
             model='gemini-3-flash-preview',
-            contents=[gemini_file, prompt]
+            contents=[gemini_file, prompt],
+            config=types.GenerateContentConfig(
+                thinking_config=types.ThinkingConfig(includeThoughts=True),
+                temperature=0.2  # より確実な（ブレの少ない）判定を行わせるため温度を下げる
+            )
         )
 
         feedback_text = response.text.strip()
