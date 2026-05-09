@@ -21,7 +21,19 @@ export default function SettingsPage() {
         console.error("Failed to parse NG words");
       }
     } else {
-      setNgWords(["副業", "1000円", "稼ぐ", "儲け", "収益", "投資", "株", "ギャンブル"]);
+      setNgWords([
+        "副業", "1000円", "稼ぐ", "儲け", "収益", "投資", "株", "ギャンブル", "円", "利益", 
+        "報酬", "金利", "収支", "支払い", "支払う", "給料", "給与", "賃金", "資産", "月収", 
+        "売却", "不労所得", "円高", "円安", "ドル", "$", "¥", "金", "年金", "借金", 
+        "徴収", "料金", "料", "値上げ", "物価", "時給", "安値", "高値", "価値", "価格", 
+        "減税", "割引", "定面", "高騰", "定価", "支給", "高価格", "低価格", "原価", "高い", 
+        "低い", "年収", "月給", "日給", "ギャラ", "現金", "小遣い", "おこづかい", "資金", "売上", 
+        "紹介", "招待", "物販", "アフィリエイト", "フォロー", "TikTok見るだけ", "運用", "PR", "コメント", "出品", 
+        "商品", "ギャンブル系", "カジノ", "得", "酒", "タバコ", "子供", "ヒトラー", "パパ活", "コロナ", 
+        "洗脳", "操る", "アホ", "バカ", "ボケ", "無料ギフト", "嫌い", "無理", "爆破", "盗む", 
+        "外人", "キチガイ", "クソ野郎", "AI", "簡単にできる", "プロフリンク", "プロフ", "リンク", "りんく", "URL", 
+        "UPL", "LINE", "ライン", "YouTube", "amazon", "楽天", "消された"
+      ]);
     }
   }, []);
 
@@ -68,7 +80,7 @@ export default function SettingsPage() {
   };
 
   return (
-    <div className="p-8 max-w-[800px] mx-auto w-full">
+    <div className="p-4 sm:p-8 max-w-[800px] mx-auto w-full">
       <div className="mb-6 border-b border-[#E5E5E5] pb-4">
         <h1 className="text-xl font-bold text-[#333333] mb-1">システム設定</h1>
         <p className="text-[#666666] text-xs">AI解析を利用するためのAPIキーや、自動チェックする禁止用語を管理します。</p>
@@ -76,7 +88,7 @@ export default function SettingsPage() {
 
       <div className="space-y-6">
         {/* API Key Section */}
-        <div className="bg-white rounded border border-[#E5E5E5] p-6 shadow-sm">
+        <div className="bg-white rounded border border-[#E5E5E5] p-4 sm:p-6 shadow-sm">
           <div className="flex items-center mb-4">
             <KeyRound className="w-5 h-5 text-[#2C4A73] mr-2" />
             <h2 className="text-sm font-bold text-[#333333]">Gemini API キー</h2>
@@ -84,7 +96,7 @@ export default function SettingsPage() {
           <p className="text-xs text-[#666666] mb-4">
             動画解析を行うための認証キーです。ブラウザのローカルストレージに安全に保存されます。
           </p>
-          <div className="flex space-x-3">
+          <div className="flex flex-col sm:flex-row gap-3">
             <input
               type="password"
               value={apiKey}
@@ -103,7 +115,7 @@ export default function SettingsPage() {
         </div>
 
         {/* NG Words Section */}
-        <div className="bg-white rounded border border-[#E5E5E5] p-6 shadow-sm">
+        <div className="bg-white rounded border border-[#E5E5E5] p-4 sm:p-6 shadow-sm">
           <div className="flex items-center mb-4">
             <ShieldAlert className="w-5 h-5 text-[#D9534F] mr-2" />
             <h2 className="text-sm font-bold text-[#333333]">NGワード（禁止用語）リスト</h2>
@@ -112,7 +124,7 @@ export default function SettingsPage() {
             ここで登録した単語が動画の音声やテロップに含まれている場合、自動的に課題として指摘されます。
           </p>
           
-          <div className="flex space-x-3 mb-6">
+          <div className="flex flex-col sm:flex-row gap-3 mb-6">
             <input
               type="text"
               value={newWord}
@@ -157,7 +169,7 @@ export default function SettingsPage() {
       </div>
 
       {isSaved && (
-        <div className="fixed bottom-6 right-6 bg-white border border-[#5CB85C] text-[#333333] px-4 py-3 rounded shadow-lg flex items-center animate-fade-in-up">
+        <div className="fixed bottom-4 right-4 sm:bottom-6 sm:right-6 bg-white border border-[#5CB85C] text-[#333333] px-4 py-3 rounded shadow-lg flex items-center animate-fade-in-up">
           <CheckCircle2 className="w-4 h-4 text-[#5CB85C] mr-2" />
           <span className="font-bold text-sm">設定を保存しました</span>
         </div>

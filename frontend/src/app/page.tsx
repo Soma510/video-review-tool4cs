@@ -157,7 +157,7 @@ export default function DashboardPage() {
   };
 
   return (
-    <div className="p-8 max-w-[1000px] mx-auto w-full">
+    <div className="p-4 sm:p-8 max-w-[1000px] mx-auto w-full">
       <div className="mb-6 flex items-end justify-between border-b border-[#E5E5E5] pb-4">
         <div>
           <h1 className="text-xl font-bold text-[#333333] mb-1">動画添削ダッシュボード</h1>
@@ -167,7 +167,7 @@ export default function DashboardPage() {
 
       <div className="space-y-6">
         {/* Upload Section */}
-        <div className="bg-white rounded border border-[#E5E5E5] p-6 shadow-sm">
+        <div className="bg-white rounded border border-[#E5E5E5] p-4 sm:p-6 shadow-sm">
           <h2 className="text-sm font-bold text-[#333333] border-l-4 border-[#2C4A73] pl-2 mb-4">対象動画のアップロード</h2>
           <div className="flex flex-col sm:flex-row gap-4">
             <label className="cursor-pointer flex flex-col items-center justify-center flex-1 h-32 border-2 border-dashed border-[#DCD9D0] bg-[#FAF9F6] rounded hover:bg-[#F5F4F0] transition-colors">
@@ -190,8 +190,8 @@ export default function DashboardPage() {
         {activeReviews.map(item => (
           <div key={item.id} className="bg-white rounded border border-[#E5E5E5] shadow-sm overflow-hidden">
             {/* Header */}
-            <div className="px-6 py-3 border-b border-[#E5E5E5] bg-[#FAF9F6] flex items-center justify-between">
-              <div className="flex items-center space-x-3">
+            <div className="px-4 sm:px-6 py-3 border-b border-[#E5E5E5] bg-[#FAF9F6] flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3 sm:gap-0">
+              <div className="flex items-center space-x-3 w-full sm:w-auto">
                 {item.status === "uploading" && <Loader2 className="w-4 h-4 text-[#2C4A73] animate-spin" />}
                 {item.status === "done" && <CheckCircle2 className="w-4 h-4 text-[#5CB85C]" />}
                 {item.status === "error" && <AlertTriangle className="w-4 h-4 text-[#D9534F]" />}
@@ -232,7 +232,7 @@ export default function DashboardPage() {
             </div>
 
             {/* Body */}
-            <div className="p-6">
+            <div className="p-4 sm:p-6">
               {item.status === "uploading" && (
                 <div className="flex items-center justify-center py-8 text-[#666666] text-sm">
                   <Loader2 className="w-5 h-5 mr-3 animate-spin text-[#2C4A73]" />
@@ -263,7 +263,7 @@ export default function DashboardPage() {
           <div className="bg-white rounded border border-[#E5E5E5] shadow-sm overflow-hidden">
             <button
               onClick={() => setHistoryOpen(!historyOpen)}
-              className="w-full px-6 py-4 bg-[#FAF9F6] flex items-center justify-between hover:bg-[#F5F4F0] transition-colors"
+              className="w-full px-4 sm:px-6 py-4 bg-[#FAF9F6] flex items-center justify-between hover:bg-[#F5F4F0] transition-colors"
             >
               <h2 className="text-sm font-bold text-[#333333] flex items-center">
                 <Clock className="w-4 h-4 mr-2 text-[#2C4A73]" />
@@ -275,7 +275,7 @@ export default function DashboardPage() {
             {historyOpen && (
               <div className="divide-y divide-[#E5E5E5]">
                 {history.map(item => (
-                  <div key={item.id} className="px-6 py-3 flex items-center justify-between hover:bg-[#FAF9F6]">
+                  <div key={item.id} className="px-4 sm:px-6 py-3 flex items-center justify-between hover:bg-[#FAF9F6]">
                     <div className="flex-1 min-w-0">
                       <span className="text-sm font-medium text-[#333333] truncate block">{item.fileName}</span>
                       <span className="text-xs text-[#999999]">{item.timestamp}</span>

@@ -10,8 +10,8 @@ export default function TopNav() {
 
   return (
     <header className="bg-white border-b border-[#E5E5E5] sticky top-0 z-50">
-      <div className="max-w-[1000px] mx-auto px-6 h-14 flex items-center justify-between">
-        <div className="flex items-center space-x-8">
+      <div className="max-w-[1000px] mx-auto px-4 sm:px-6 h-14 flex items-center justify-between overflow-x-auto whitespace-nowrap scrollbar-hide">
+        <div className="flex items-center space-x-4 sm:space-x-8">
           <Link href="/" className="flex items-center">
             <Video className="w-5 h-5 text-[#2C4A73] mr-2" />
             <span className="font-bold text-[#333333] tracking-wide text-sm">動画添削AIシステム</span>
@@ -45,7 +45,7 @@ export default function TopNav() {
           </nav>
         </div>
         
-        <div className="text-xs text-[#999999] font-medium border border-[#E5E5E5] px-2 py-1 rounded">
+        <div className="hidden sm:block text-xs text-[#999999] font-medium border border-[#E5E5E5] px-2 py-1 rounded">
           CS担当者用ツール
         </div>
       </div>
