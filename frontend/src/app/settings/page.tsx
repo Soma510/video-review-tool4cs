@@ -41,8 +41,21 @@ export default function SettingsPage() {
   };
 
   const addNgWord = () => {
-    if (!newWord.trim() || ngWords.includes(newWord.trim())) return;
-    const updatedWords = [...ngWords, newWord.trim()];
+    if (!newWord.trim()) return;
+    
+    const inputWords = newWord
+      .split(/[, \n、　]+/)
+      .map(w => w.trim())
+      .filter(w => w !== "");
+      
+    const uniqueNewWords = inputWords.filter(w => !ngWords.includes(w));
+    
+    if (uniqueNewWords.length === 0) {
+      setNewWord("");
+      return;
+    }
+    
+    const updatedWords = Array.from(new Set([...ngWords, ...uniqueNewWords]));
     setNgWords(updatedWords);
     setNewWord("");
     handleSaveNgWords(updatedWords);
@@ -105,7 +118,7 @@ export default function SettingsPage() {
               value={newWord}
               onChange={(e) => setNewWord(e.target.value)}
               onKeyDown={(e) => e.key === 'Enter' && addNgWord()}
-              placeholder="追加するNGワードを入力"
+              placeholder="追加するNGワードを入力（スペースやカンマ区切りで複数可）"
               className="flex-1 bg-[#FAF9F6] border border-[#E5E5E5] text-[#333333] rounded px-3 py-2 text-sm focus:outline-none focus:border-[#2C4A73]"
             />
             <button
