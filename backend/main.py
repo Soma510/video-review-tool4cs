@@ -65,7 +65,8 @@ def detect_jetcut_issues(video_path: str) -> List[str]:
 async def analyze_video(
     video: UploadFile = File(...),
     api_key: str = Form(...),
-    ng_words: str = Form("[]")
+    ng_words: str = Form("[]"),
+    prompt_ja: str = Form(None)
 ):
     try:
         ng_words_list = json.loads(ng_words)
@@ -101,7 +102,7 @@ async def analyze_video(
                 raise HTTPException(status_code=500, detail="Gemini video processing failed.")
 
         # 3. プロンプト構築
-        prompt = f"""外注先の動画クリエイターが作成したショート動画（CapCutの編集画面録画）を添削し、フィードバック文を作成してください。
+        default_prompt_ja = """外注先の動画クリエイターが作成したショート動画（CapCutの編集画面録画）を添削し、フィードバック文を作成してください。
 
 【重要な前提】
 ・この動画はCapCutの編集画面をスマホの画面録画機能で録画したものです。
@@ -180,6 +181,23 @@ async def analyze_video(
 
 ※そのまま外注先にコピペしてLINE等で送れる、完成された文章にしてください。
 """
+        
+        base_prompt = prompt_ja if prompt_ja else default_prompt_ja
+        base_prompt = base_prompt.replace("{ng_words_list}", str(ng_words_list))
+        base_prompt = base_prompt.replace("{audio_issues_text}", audio_issues_text)
+
+        # 4. プロンプトの英語への翻訳 (実際の指示出しは英語で行う)
+        translation_instruction = (
+            "Translate the following video review instruction prompt from Japanese to English. "
+            "Ensure that the nuances, formatting constraints, and the strict instructions (such as ignoring audio transcripts for text counting) are perfectly preserved. "
+            "IMPORTANT: The final instruction must explicitly require the AI to output the final review result in Japanese."
+        )
+        
+        translation_response = client.models.generate_content(
+            model='gemini-3.5-flash',
+            contents=[translation_instruction + "\n\n---\n\n" + base_prompt]
+        )
+        prompt_en = translation_response.text.strip()
 
         from google.genai import types
 
@@ -205,16 +223,15 @@ async def analyze_video(
                                 mime_type='video/mp4'),
                             video_metadata=types.VideoMetadata(fps=5)
                         ),
-                        types.Part(text=prompt)
+                        types.Part(text=prompt_en)
                     ]
                 ),
                 config=gen_config
             )
         else:
-            # 20MB以上: File API経由（fps指定不可）
             response = client.models.generate_content(
                 model='gemini-3.5-flash',
-                contents=[gemini_file, prompt],
+                contents=[gemini_file, prompt_en],
                 config=gen_config
             )
 
