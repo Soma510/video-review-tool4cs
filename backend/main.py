@@ -80,20 +80,25 @@ async def analyze_video(
         tmp_path = tmp.name
 
     gemini_file = None
+    video_size_mb = len(content) / (1024 * 1024)
+    use_inline = video_size_mb < 20  # 20MB未満ならinline_data方式（fps指定可能）
+
     try:
         # 1. 音声解析（ジェットカット検出）
         audio_issues = detect_jetcut_issues(tmp_path)
         audio_issues_text = "\n".join(audio_issues) if audio_issues else "無音区間は検出されませんでした。"
 
-        # 2. Geminiにアップロード
-        gemini_file = client.files.upload(file=tmp_path)
+        # 2. 動画の準備（inline_data方式 or File API方式）
+        if not use_inline:
+            # 20MB以上の場合はFile APIでアップロード（fps指定不可）
+            gemini_file = client.files.upload(file=tmp_path)
 
-        while gemini_file.state.name == "PROCESSING":
-            time.sleep(2)
-            gemini_file = client.files.get(name=gemini_file.name)
+            while gemini_file.state.name == "PROCESSING":
+                time.sleep(2)
+                gemini_file = client.files.get(name=gemini_file.name)
 
-        if gemini_file.state.name == "FAILED":
-            raise HTTPException(status_code=500, detail="Gemini video processing failed.")
+            if gemini_file.state.name == "FAILED":
+                raise HTTPException(status_code=500, detail="Gemini video processing failed.")
 
         # 3. プロンプト構築
         prompt = f"""外注先の動画クリエイターが作成したショート動画（CapCutの編集画面録画）を添削し、フィードバック文を作成してください。
@@ -134,9 +139,9 @@ async def analyze_video(
 参考動画に出てくる画像を模倣して適切な画像が挿入されているか。
 
 ⑦ 文字数
-・【超重要】音声の書き起こし（喋っている内容）をベースにしないでください。動画の画面に「視覚的に表示されているテロップの文字」だけを見て判断してください。
-・画面にその瞬間に表示されている1行の文字数が5〜8文字程度かどうかを判定してください。
-・テロップが切り替わったら「別のテロップ」です。前後のテロップを合算して「13文字で文字数オーバーです」と判定するのは絶対にやめてください。
+・【超重要】このタスクでは「音声を完全にミュートにした状態」を想定してください。音声の書き起こし内容は完全に無視し、AIが視覚的に抽出した画像フレームに「くっきりと映っているテロップ」の文字だけをカウント対象としてください。
+・画面にその瞬間に視覚的に表示されている「1行の文字数」が5〜8文字程度かどうかを判定してください。
+・テロップが切り替わったら「全く別のテロップ」です。前後のテロップを合算して文字数をカウントすることは絶対にやめてください。
 ・文字数に問題がない場合は、この項目については何も指摘しないでください。
 
 ⑧ 数字ベースの強調
@@ -177,14 +182,41 @@ async def analyze_video(
 """
 
         from google.genai import types
-        response = client.models.generate_content(
-            model='gemini-3-flash-preview',
-            contents=[gemini_file, prompt],
-            config=types.GenerateContentConfig(
-                thinking_config=types.ThinkingConfig(includeThoughts=True),
-                temperature=0.2  # より確実な（ブレの少ない）判定を行わせるため温度を下げる
-            )
+
+        # 4. Gemini API呼び出し（inline_data方式 or File API方式）
+        gen_config = types.GenerateContentConfig(
+            thinking_config=types.ThinkingConfig(
+                thinking_level='high',
+                include_thoughts=True
+            ),
+            media_resolution='high',
+            temperature=0.2  # より確実な（ブレの少ない）判定を行わせるため温度を下げる
         )
+
+        if use_inline:
+            # 20MB未満: inline_dataでfps=5を指定（テロップ切り替わりを200msごとに捕捉）
+            response = client.models.generate_content(
+                model='gemini-3.5-flash',
+                contents=types.Content(
+                    parts=[
+                        types.Part(
+                            inline_data=types.Blob(
+                                data=content,
+                                mime_type='video/mp4'),
+                            video_metadata=types.VideoMetadata(fps=5)
+                        ),
+                        types.Part(text=prompt)
+                    ]
+                ),
+                config=gen_config
+            )
+        else:
+            # 20MB以上: File API経由（fps指定不可）
+            response = client.models.generate_content(
+                model='gemini-3.5-flash',
+                contents=[gemini_file, prompt],
+                config=gen_config
+            )
 
         feedback_text = response.text.strip()
 
