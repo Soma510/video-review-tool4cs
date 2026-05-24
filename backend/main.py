@@ -189,8 +189,11 @@ async def analyze_video(
         # 4. プロンプトの英語への翻訳 (実際の指示出しは英語で行う)
         translation_instruction = (
             "Translate the following video review instruction prompt from Japanese to English. "
-            "Ensure that the nuances, formatting constraints, and the strict instructions (such as ignoring audio transcripts for text counting) are perfectly preserved. "
-            "IMPORTANT: The final instruction must explicitly require the AI to output the final review result in Japanese."
+            "Ensure that all nuances, formatting constraints, and strict instructions are perfectly preserved. "
+            "CRITICAL INSTRUCTIONS TO ADD TO THE TRANSLATED PROMPT: "
+            "1. NEVER group or summarize errors (e.g., do not say 'Errors are at 0:00, 0:06, 0:37...'). "
+            "2. You MUST list EVERY SINGLE occurrence of an issue individually with its exact timestamp and a detailed explanation of what is wrong and how to fix it. "
+            "3. The final output MUST be entirely in Japanese."
         )
         
         translation_response = client.models.generate_content(
@@ -221,7 +224,7 @@ async def analyze_video(
                             inline_data=types.Blob(
                                 data=content,
                                 mime_type='video/mp4'),
-                            video_metadata=types.VideoMetadata(fps=5)
+                            video_metadata=types.VideoMetadata(fps=4)
                         ),
                         types.Part(text=prompt_en)
                     ]
