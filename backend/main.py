@@ -2,6 +2,10 @@ import os
 import json
 import tempfile
 import time
+import urllib.request
+import csv
+import io
+import re
 from fastapi import FastAPI, UploadFile, Form, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydub import AudioSegment
@@ -24,6 +28,44 @@ def format_time(ms: int) -> str:
     seconds = int((ms / 1000) % 60)
     minutes = int((ms / (1000 * 60)) % 60)
     return f"{minutes:02d}:{seconds:02d}"
+
+def fetch_call_to_action_list(url: str) -> str:
+    """スプレッドシートURLからCSVとしてデータを取得し、訴求文のリストを文字列として返す"""
+    default_action = "「〇〇とコメントしてプロフィールのリンクを見てね」という構成になっているか。"
+    if not url:
+        return default_action
+    
+    try:
+        base_match = re.search(r'(https://docs\.google\.com/spreadsheets/d/[a-zA-Z0-9-_]+)/', url)
+        if not base_match:
+            return default_action
+        
+        base_url = base_match.group(1)
+        gid_match = re.search(r'gid=([0-9]+)', url)
+        gid = gid_match.group(1) if gid_match else "0"
+        
+        export_url = f"{base_url}/export?format=csv&gid={gid}"
+        
+        req = urllib.request.Request(export_url)
+        with urllib.request.urlopen(req, timeout=10) as response:
+            csv_data = response.read().decode('utf-8')
+            
+        reader = csv.reader(io.StringIO(csv_data))
+        lines = list(reader)
+        
+        actions = []
+        for row in lines[2:]:  # 3行目以降にデータがあると想定
+            if len(row) >= 2 and row[1].strip():
+                actions.append(f"・{row[1].strip()}")
+                
+        if not actions:
+            return default_action
+            
+        return "\n".join(actions)
+        
+    except Exception as e:
+        print(f"Failed to fetch spreadsheet: {e}")
+        return default_action
 
 
 def detect_jetcut_issues(video_path: str) -> List[str]:
@@ -66,7 +108,8 @@ async def analyze_video(
     video: UploadFile = File(...),
     api_key: str = Form(...),
     ng_words: str = Form("[]"),
-    prompt_ja: str = Form(None)
+    prompt_ja: str = Form(None),
+    spreadsheet_url: str = Form(None)
 ):
     try:
         ng_words_list = json.loads(ng_words)
@@ -150,7 +193,9 @@ async def analyze_video(
 ・【超重要】ここでは「文字の大きさ」などの視覚的な装飾だけを確認してください。テキストの内容や意味に対するアドバイスは一切不要です。
 
 ⑨ 最後の訴求
-「〇〇とコメントしてプロフィールのリンクを見てね」という構成になっているか。矢印や線引きスタンプでリンク位置を明確に示しているか。
+以下のリストのいずれかのパターンの構成になっているか確認してください。矢印や線引きスタンプでリンク位置を明確に示しているかどうかも確認してください。
+【許容される訴求文リスト】
+{call_to_action_list}
 
 ⑩ その他
 背景素材の切り替えは2秒以内か。素材やテキストにアニメーションをつけているか。
@@ -183,8 +228,12 @@ async def analyze_video(
 """
         
         base_prompt = prompt_ja if prompt_ja else default_prompt_ja
+        
+        call_to_action_text = fetch_call_to_action_list(spreadsheet_url)
+        
         base_prompt = base_prompt.replace("{ng_words_list}", str(ng_words_list))
         base_prompt = base_prompt.replace("{audio_issues_text}", audio_issues_text)
+        base_prompt = base_prompt.replace("{call_to_action_list}", call_to_action_text)
 
         # 4. プロンプトの英語への翻訳 (実際の指示出しは英語で行う)
         translation_instruction = (

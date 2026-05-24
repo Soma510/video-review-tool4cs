@@ -57,6 +57,7 @@ export default function DashboardPage() {
 
     const ngWords = localStorage.getItem("ng_words") || "[]";
     const promptJa = localStorage.getItem("prompt_ja") || "";
+    const spreadsheetUrl = localStorage.getItem("spreadsheet_url") || "";
 
     const newItem: ReviewItem = {
       id: crypto.randomUUID(),
@@ -76,6 +77,9 @@ export default function DashboardPage() {
       formData.append("ng_words", ngWords);
       if (promptJa) {
         formData.append("prompt_ja", promptJa);
+      }
+      if (spreadsheetUrl) {
+        formData.append("spreadsheet_url", spreadsheetUrl);
       }
 
       const rawApiUrl = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
