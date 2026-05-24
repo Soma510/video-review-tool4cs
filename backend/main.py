@@ -207,7 +207,7 @@ async def analyze_video(
                 thinking_level='high',
                 include_thoughts=True
             ),
-            media_resolution='high',
+            media_resolution='MEDIA_RESOLUTION_HIGH',
             temperature=0.2  # より確実な（ブレの少ない）判定を行わせるため温度を下げる
         )
 
