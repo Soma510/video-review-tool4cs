@@ -14,6 +14,7 @@ interface ReviewItem {
 }
 
 const HISTORY_KEY = "review_history";
+const ACTIVE_KEY = "active_reviews";
 
 function loadHistory(): ReviewItem[] {
   if (typeof window === "undefined") return [];
@@ -38,7 +39,29 @@ export default function DashboardPage() {
 
   useEffect(() => {
     setHistory(loadHistory());
+
+    // リロード時にactiveReviewsを復元する
+    try {
+      const rawActive = localStorage.getItem(ACTIVE_KEY);
+      if (rawActive) {
+        const parsedActive: ReviewItem[] = JSON.parse(rawActive);
+        // アップロード中にリロードされた場合、通信が切れているためエラー状態に変更する
+        const restoredActive = parsedActive.map(item => 
+          item.status === "uploading" 
+            ? { ...item, status: "error" as const, errorMessage: "【エラー】画面が切り替わったため通信が中断されました。再度アップロードしてください。" } 
+            : item
+        );
+        setActiveReviews(restoredActive);
+      }
+    } catch (e) {
+      console.error("Failed to load active reviews", e);
+    }
   }, []);
+
+  useEffect(() => {
+    // activeReviewsが変更されるたびに保存する
+    localStorage.setItem(ACTIVE_KEY, JSON.stringify(activeReviews));
+  }, [activeReviews]);
 
   const startReview = async (file: File) => {
     const apiKey = localStorage.getItem("gemini_api_key");
