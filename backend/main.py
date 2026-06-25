@@ -18,7 +18,9 @@ app = FastAPI(title="Video Review API")
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_credentials=True,
+    # allow_origins=["*"] と allow_credentials=True はCORS仕様上両立しない。
+    # APIキーはフォームボディで送られ、Cookie等の認証情報は使わないためFalseにする。
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
@@ -30,41 +32,77 @@ def format_time(ms: int) -> str:
     return f"{minutes:02d}:{seconds:02d}"
 
 def fetch_call_to_action_list(url: str) -> str:
-    """スプレッドシートURLからCSVとしてデータを取得し、訴求文のリストを文字列として返す"""
+    """スプレッドシートURLからCSVとしてデータを取得し、訴求文のリストを文字列として返す。
+    訴求文はB列の4行目以降（B4〜）に並んでおり、B列が空になった時点で終端とみなす
+    （B11以降に入り得る無関係なテキストを取り込まないため）。
+    取得・解析に失敗した場合は default_action にフォールバックし、理由をログ出力する。"""
     default_action = "「〇〇とコメントしてプロフィールのリンクを見てね」という構成になっているか。"
     if not url:
+        print("[call_to_action] No spreadsheet URL provided; using default action.")
         return default_action
-    
+
     try:
         base_match = re.search(r'(https://docs\.google\.com/spreadsheets/d/[a-zA-Z0-9-_]+)/', url)
         if not base_match:
+            print(f"[call_to_action] URL did not match expected spreadsheet pattern: {url!r}; using default.")
             return default_action
-        
+
         base_url = base_match.group(1)
         gid_match = re.search(r'gid=([0-9]+)', url)
         gid = gid_match.group(1) if gid_match else "0"
-        
+
         export_url = f"{base_url}/export?format=csv&gid={gid}"
-        
-        req = urllib.request.Request(export_url)
+
+        req = urllib.request.Request(
+            export_url,
+            headers={"User-Agent": "Mozilla/5.0 (video-review-tool)"}
+        )
         with urllib.request.urlopen(req, timeout=10) as response:
-            csv_data = response.read().decode('utf-8')
-            
+            content_type = response.headers.get("Content-Type", "")
+            raw = response.read()
+            final_url = response.geturl()
+
+        # 非公開スプシの場合、GoogleはCSVではなくログインHTMLをHTTP 200で返す。
+        # これを検出してフォールバックし、原因が分かるようにログを残す。
+        head = raw[:512].lstrip().lower()
+        looks_like_html = (
+            "text/html" in content_type.lower()
+            or head.startswith(b"<!doctype html")
+            or b"<html" in head
+            or "accounts.google.com" in final_url
+        )
+        if looks_like_html:
+            print(
+                "[call_to_action] Received an HTML/login response instead of CSV "
+                f"(Content-Type={content_type!r}, final_url={final_url!r}). "
+                "The spreadsheet is likely NOT shared as 'anyone with the link'. Using default action."
+            )
+            return default_action
+
+        csv_data = raw.decode("utf-8", errors="replace")
         reader = csv.reader(io.StringIO(csv_data))
         lines = list(reader)
-        
+
         actions = []
-        for row in lines[2:]:  # 3行目以降にデータがあると想定
-            if len(row) >= 2 and row[1].strip():
-                actions.append(f"・{row[1].strip()}")
-                
+        for row in lines[3:]:  # 4行目（B4）以降を対象
+            if len(row) < 2:
+                break  # B列が存在しない行に到達したら終了
+            cell = row[1].strip()
+            if not cell:
+                break  # B列が空＝訴求文リストの終端（B11以降の無関係テキストを除外）
+            actions.append(f"・{cell}")
+
         if not actions:
+            print(
+                f"[call_to_action] CSV parsed but no action rows found in column B from row 4 "
+                f"(rows={len(lines)}). Using default action."
+            )
             return default_action
-            
+
         return "\n".join(actions)
-        
+
     except Exception as e:
-        print(f"Failed to fetch spreadsheet: {e}")
+        print(f"[call_to_action] Failed to fetch/parse spreadsheet ({type(e).__name__}): {e}. Using default action.")
         return default_action
 
 
@@ -118,8 +156,16 @@ async def analyze_video(
 
     client = genai.Client(api_key=api_key)
 
+    # アップロードサイズの上限ガード（read→検査→temp作成 の順でtemp fileのleakを防ぐ）
+    MAX_UPLOAD_MB = 200
+    content = await video.read()
+    if len(content) > MAX_UPLOAD_MB * 1024 * 1024:
+        raise HTTPException(
+            status_code=413,
+            detail=f"動画ファイルが大きすぎます（上限 {MAX_UPLOAD_MB}MB）。ファイルを圧縮するか短く分割してください。",
+        )
+
     with tempfile.NamedTemporaryFile(delete=False, suffix=".mp4") as tmp:
-        content = await video.read()
         tmp.write(content)
         tmp_path = tmp.name
 
@@ -163,16 +209,11 @@ async def analyze_video(
 雑音やこもりがないか。棒読みにならず抑揚がついているか。聴こえやすい音量か。
 
 ③ NGワード
-以下のNGワードが「画面上のテロップ」にそのまま含まれていないか確認してください。
-これらのNGワードは、プラットフォーム側のAI検知を回避するために「文字の置き換え（伏せ字や当て字）」を行う必要があります。そのまま使われている場合は指摘し、以下の例を参考に文字を変更するよう修正を促してください。
-
-【文字変更のルールの例】
-・濁点を取る（例：マネタイズ → マネタイス）
-・一部を半角カタカナにする（例：円 → ｴﾝ、稼げる → ｶｾげる、アフィリエイト → ｱﾌｨリエイト または アフリエイト）
-・英字や数字に置き換える（例：YouTube → Y0uTube）
-・同音異義語の当て字にする（例：収益化 → 収駅化）
-・カタカナで表記する（例：LINE → ライン）
-
+以下のNGワードが「画面上のテロップ」に含まれていないか確認してください。
+テロップに使う場合は「半角スペース」を入れてAIの検知を回避する必要があります。
+【スペースの入れ方のルール】
+・2文字のNGワード → 間にスペース（例：副業→「副 業」）
+・3文字以上のNGワード → 最小限の箇所に1つだけスペースを入れる（例：収益化→「収 益化」）
 ユーザー定義のNGワードリスト: {ng_words_list}
 
 ④ エフェクト
@@ -181,7 +222,10 @@ async def analyze_video(
 ・全てのテキストにエフェクトをかけるのではなく、大事な部分や伝えたい部分だけにつける。強弱をつける。
 
 ⑤ テロップ背景
-・背景の帯の角が「鋭角」になっているか。明らかに丸みを帯びている場合のみ指摘すること。少しでも角張って見えるなら問題ない。
+・テロップ（字幕）の背景に敷かれている「帯（背景バー）」の四隅の形状を1つずつ確認してください。判定対象は帯の四隅であり、文字そのものの形ではありません。
+・【判定基準】基準は「直角（角丸半径ゼロの長方形）」です。四隅すべてがほぼ直角（ピシッと尖った90度）に見えるなら正常で、指摘は不要です。
+・【NGの定義】四隅のいずれかに、はっきりと弧を描く丸み（角丸長方形＝角がカーブして削れている状態）が見られる場合のみ「角が丸い」と指摘してください。角丸の半径が帯の高さのおおよそ1割を超えてカーブが明確に視認できる場合がこれに該当します。
+・【誤判定の防止】圧縮ノイズ・低解像度・アンチエイリアス（境界のわずかなぼやけ）で角がわずかに滑らかに見えることがありますが、これは「角丸」ではありません。明確なカーブが確認できない限り直角とみなし、指摘しないでください。判断に迷う中間的なケースは「直角（正常）」として扱ってください。
 ・画面枠ギリギリにはみ出していないか。テキスト、挿入画像、スタンプなども枠ギリギリにならないように。
 
 ⑥ 画像の挿入
@@ -236,28 +280,46 @@ async def analyze_video(
 """
         
         base_prompt = prompt_ja if prompt_ja else default_prompt_ja
-        
+
         call_to_action_text = fetch_call_to_action_list(spreadsheet_url)
-        
-        base_prompt = base_prompt.replace("{ng_words_list}", str(ng_words_list))
-        base_prompt = base_prompt.replace("{audio_issues_text}", audio_issues_text)
-        base_prompt = base_prompt.replace("{call_to_action_list}", call_to_action_text)
 
         # 4. プロンプトの英語への翻訳 (実際の指示出しは英語で行う)
+        # 【重要】NGワードや訴求文などの日本語データは「翻訳前」に埋め込むと英訳されて壊れる
+        # （例：「副業」→"side job"）。画面テロップとの逐語照合が必要なため、ここでは
+        # プレースホルダ（{ng_words_list} 等）を残したままテンプレートだけを英訳し、
+        # 実データは「翻訳後」に差し込む。
         translation_instruction = (
             "Translate the following video review instruction prompt from Japanese to English. "
             "Ensure that all nuances, formatting constraints, and strict instructions are perfectly preserved. "
+            "CRITICAL - PLACEHOLDER PRESERVATION: The text contains literal placeholder tokens written "
+            "exactly as {ng_words_list}, {audio_issues_text}, and {call_to_action_list}. "
+            "You MUST output these three tokens verbatim and unchanged (same ASCII characters, same curly "
+            "braces). Do NOT translate, rename, reformat, or remove them, and do NOT add or remove the braces. "
+            "They are substituted programmatically AFTER translation. "
+            "Any Japanese text that will later appear inside these placeholders (e.g. on-screen telop NG words "
+            "and call-to-action phrases) must be matched LITERALLY as Japanese; do not expect them in English. "
             "CRITICAL INSTRUCTIONS TO ADD TO THE TRANSLATED PROMPT: "
             "1. NEVER group or summarize errors (e.g., do not say 'Errors are at 0:00, 0:06, 0:37...'). "
             "2. You MUST list EVERY SINGLE occurrence of an issue individually with its exact timestamp and a detailed explanation of what is wrong and how to fix it. "
             "3. The final output MUST be entirely in Japanese."
         )
-        
+
+        # 1) テンプレートのみ英訳（プレースホルダは保持したまま）
         translation_response = client.models.generate_content(
             model='gemini-3.5-flash',
             contents=[translation_instruction + "\n\n---\n\n" + base_prompt]
         )
         prompt_en = translation_response.text.strip()
+
+        # 2) 翻訳「後」に実データを差し込む（NGワード・訴求文・無音区間を日本語のまま保持）
+        required_tokens = ["{ng_words_list}", "{audio_issues_text}", "{call_to_action_list}"]
+        if not all(tok in prompt_en for tok in required_tokens):
+            # 翻訳器がプレースホルダを壊した場合は日本語テンプレートにフォールバック
+            print("[translation] Placeholder token missing after translation; falling back to JA template.")
+            prompt_en = base_prompt
+        prompt_en = prompt_en.replace("{ng_words_list}", str(ng_words_list))
+        prompt_en = prompt_en.replace("{audio_issues_text}", audio_issues_text)
+        prompt_en = prompt_en.replace("{call_to_action_list}", call_to_action_text)
 
         from google.genai import types
 
@@ -272,7 +334,7 @@ async def analyze_video(
         )
 
         if use_inline:
-            # 20MB未満: inline_dataでfps=5を指定（テロップ切り替わりを200msごとに捕捉）
+            # 20MB未満: inline_dataでfps=4を指定（テロップ切り替わりを250msごとに捕捉）
             response = client.models.generate_content(
                 model='gemini-3.5-flash',
                 contents=types.Content(
