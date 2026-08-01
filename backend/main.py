@@ -6,18 +6,31 @@ import urllib.request
 import csv
 import io
 import re
+import hashlib
+from collections import OrderedDict
 from fastapi import FastAPI, UploadFile, Form, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydub import AudioSegment
 from pydub.silence import detect_silence
 from google import genai
-from typing import List
+from typing import List, Optional
+
+from prompt import DEFAULT_PROMPT_JA
 
 app = FastAPI(title="Video Review API")
 
+# 許可するオリジンは環境変数 ALLOWED_ORIGINS（カンマ区切り）で絞り込める。
+# 未設定の場合は従来どおり全許可（ローカル開発・検証用）。
+_allowed_origins_env = os.getenv("ALLOWED_ORIGINS", "").strip()
+ALLOWED_ORIGINS = (
+    [o.strip() for o in _allowed_origins_env.split(",") if o.strip()]
+    if _allowed_origins_env
+    else ["*"]
+)
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=ALLOWED_ORIGINS,
     # allow_origins=["*"] と allow_credentials=True はCORS仕様上両立しない。
     # APIキーはフォームボディで送られ、Cookie等の認証情報は使わないためFalseにする。
     allow_credentials=False,
@@ -26,85 +39,251 @@ app.add_middleware(
 )
 
 
+@app.get("/default-prompt")
+def get_default_prompt():
+    """フロントエンドの設定画面が初期表示・リセット時に取得するデフォルトプロンプト。
+    プロンプト本文をバックエンド側の1箇所（prompt.py）に集約するためのエンドポイント。"""
+    return {"prompt": DEFAULT_PROMPT_JA}
+
+
+# プロンプト英訳の結果キャッシュ。
+# プロンプトは設定画面で変更しない限り毎回同一なので、解析のたびに再翻訳するのは
+# 純粋な無駄（実測で1回あたり約7,800トークン＝全体の約14.5%）。日本語プロンプトの
+# ハッシュをキーに、英訳済みテンプレート（プレースホルダは未置換の状態）を保持する。
+# プロセス内メモリのみ。再起動で消えるが、その場合も一度翻訳し直せば復帰する。
+_translation_cache: "OrderedDict[str, str]" = OrderedDict()
+_TRANSLATION_CACHE_MAX = 20  # プロンプトを編集して試行錯誤しても膨らみすぎない上限
+
+
+def get_cached_translation(prompt_ja_text: str) -> Optional[str]:
+    key = hashlib.sha256(prompt_ja_text.encode("utf-8")).hexdigest()
+    cached = _translation_cache.get(key)
+    if cached is not None:
+        _translation_cache.move_to_end(key)  # LRU: 使ったものを末尾へ
+    return cached
+
+
+def store_translation(prompt_ja_text: str, prompt_en_text: str) -> None:
+    key = hashlib.sha256(prompt_ja_text.encode("utf-8")).hexdigest()
+    _translation_cache[key] = prompt_en_text
+    _translation_cache.move_to_end(key)
+    while len(_translation_cache) > _TRANSLATION_CACHE_MAX:
+        _translation_cache.popitem(last=False)  # 最も古いものから捨てる
+
+
+# 動画のサンプリングFPS。Geminiのデフォルトは1fpsだが、テロップの切り替わりを
+# 捕捉するために既定では4fps（250ms間隔）でオーバーサンプリングする。
+# VIDEOトークンはfpsに比例するため、コスト調整のつまみとして設定画面から変更できる。
+DEFAULT_FPS = 4.0
+MIN_FPS = 0.5
+MAX_FPS = 10.0
+
+
+def resolve_fps(raw) -> float:
+    """フォームで渡されたfpsを検証して返す。不正値は既定値にフォールバックする。"""
+    if raw is None or str(raw).strip() == "":
+        return DEFAULT_FPS
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        print(f"[fps] 数値として解釈できない値 {raw!r} を受け取りました。既定値 {DEFAULT_FPS} を使用します。")
+        return DEFAULT_FPS
+    if not (MIN_FPS <= value <= MAX_FPS):
+        clamped = min(max(value, MIN_FPS), MAX_FPS)
+        print(f"[fps] {value} は許容範囲({MIN_FPS}〜{MAX_FPS})外です。{clamped} に丸めました。")
+        return clamped
+    return value
+
+
+def summarize_usage(response, label: str) -> dict:
+    """Gemini APIレスポンスから消費トークン数を取り出してログ出力し、集計用のdictを返す。
+    1本あたりのコストを実測するための計測用。取得に失敗しても解析処理は止めない。"""
+    empty = {"label": label, "prompt": 0, "output": 0, "thoughts": 0, "total": 0, "by_modality": {}}
+    try:
+        usage = getattr(response, "usage_metadata", None)
+        if usage is None:
+            print(f"[usage:{label}] usage_metadata is not available.")
+            return empty
+
+        # 入力の内訳（VIDEO / AUDIO / TEXT）。動画がトークンの大半を占めるため内訳が重要。
+        by_modality: dict = {}
+        for detail in (getattr(usage, "prompt_tokens_details", None) or []):
+            modality = getattr(detail, "modality", None)
+            name = getattr(modality, "value", None) or str(modality)
+            by_modality[name] = by_modality.get(name, 0) + (getattr(detail, "token_count", 0) or 0)
+
+        summary = {
+            "label": label,
+            "prompt": getattr(usage, "prompt_token_count", 0) or 0,
+            "output": getattr(usage, "candidates_token_count", 0) or 0,
+            "thoughts": getattr(usage, "thoughts_token_count", 0) or 0,
+            "total": getattr(usage, "total_token_count", 0) or 0,
+            "by_modality": by_modality,
+        }
+
+        modality_text = ", ".join(f"{k}={v:,}" for k, v in sorted(by_modality.items())) or "(内訳なし)"
+        print(
+            f"[usage:{label}] total={summary['total']:,} "
+            f"(input={summary['prompt']:,} / thinking={summary['thoughts']:,} / output={summary['output']:,}) "
+            f"input内訳: {modality_text}"
+        )
+        return summary
+    except Exception as e:
+        print(f"[usage:{label}] Failed to read usage_metadata ({type(e).__name__}): {e}")
+        return empty
+
+
 def format_time(ms: int) -> str:
     seconds = int((ms / 1000) % 60)
     minutes = int((ms / (1000 * 60)) % 60)
     return f"{minutes:02d}:{seconds:02d}"
 
-def fetch_call_to_action_list(url: str) -> str:
-    """スプレッドシートURLからCSVとしてデータを取得し、訴求文のリストを文字列として返す。
-    訴求文はB列の4行目以降（B4〜）に並んでおり、B列が空になった時点で終端とみなす
-    （B11以降に入り得る無関係なテキストを取り込まないため）。
-    取得・解析に失敗した場合は default_action にフォールバックし、理由をログ出力する。"""
-    default_action = "「〇〇とコメントしてプロフィールのリンクを見てね」という構成になっているか。"
-    if not url:
-        print("[call_to_action] No spreadsheet URL provided; using default action.")
-        return default_action
+DEFAULT_CALL_TO_ACTION = "「〇〇とコメントしてプロフィールのリンクを見てね」という構成になっているか。"
+
+
+def _build_csv_export_url(url: str):
+    """スプレッドシートの共有URLからCSVエクスポートURLを組み立てる。
+    末尾スラッシュの有無、http/https、スキーム省略、/u/0/ 付きなど
+    実際に貼り付けられ得る形をひととおり受け付ける。"""
+    text = (url or "").strip()
+    if not text:
+        return None
+
+    # /spreadsheets/d/<ID> を拾う（/u/0/ のようなパスが挟まっていても可）
+    m = re.search(r'docs\.google\.com/spreadsheets/(?:u/\d+/)?d/([a-zA-Z0-9_-]+)', text)
+    if not m:
+        return None
+    sheet_id = m.group(1)
+
+    gid_match = re.search(r'[#&?]gid=([0-9]+)', text)
+    gid = gid_match.group(1) if gid_match else "0"
+    return f"https://docs.google.com/spreadsheets/d/{sheet_id}/export?format=csv&gid={gid}"
+
+
+# 訴求文リストの中に混ざる「注意書き」の行を見分けるための目印。
+# 実際のシートでは訴求文の直上に ⚠️注意点… という指示文が置かれており、
+# これを訴求文として取り込むとAIが「注意書き」を許容パターンとして扱ってしまう。
+ANNOTATION_PREFIXES = ("⚠", "※", "★", "▼", "●", "【", "!", "！")
+ANNOTATION_KEYWORDS = ("注意点", "注意事項")
+
+
+def _is_annotation(cell: str) -> bool:
+    text = cell.lstrip()
+    if text.startswith(ANNOTATION_PREFIXES):
+        return True
+    return any(k in text for k in ANNOTATION_KEYWORDS)
+
+
+def _extract_actions(rows):
+    """CSVの行データから訴求文の一覧を取り出す。
+
+    ・「訴求文」という見出しセルを探し、その1つ下の行・同じ列からデータを読む。
+      見出しが見つからない場合は従来どおり B4（4行目・B列）から読む。
+    ・注意書きの行（⚠️や※で始まる、「注意点」を含む等）は訴求文ではないため除外する。
+    ・空セルが2つ続いたらリストの終端とみなす。1行だけの空行では止めない
+      （空行1つでリストが途中で切れてしまう不具合の対策）。
+    """
+    start_row, col = 3, 1  # 既定: B4から
+    for r, row in enumerate(rows[:10]):
+        for c, cell in enumerate(row):
+            if "訴求文" in (cell or ""):
+                start_row, col = r + 1, c
+                break
+        else:
+            continue
+        break
+
+    actions, skipped = [], []
+    blank_run = 0
+    for row in rows[start_row:]:
+        cell = row[col].strip() if len(row) > col else ""
+        if not cell:
+            blank_run += 1
+            if blank_run >= 2:
+                break  # 空行が2つ続いたら以降は無関係なテキストとみなす
+            continue
+        blank_run = 0
+        if _is_annotation(cell):
+            skipped.append(cell)
+            continue
+        actions.append(cell)
+    return actions, skipped, start_row, col
+
+
+def fetch_call_to_action_list(url: str) -> dict:
+    """スプレッドシートURLから訴求文リストを取得する。
+
+    戻り値は必ず dict:
+      ok      … スプレッドシートから取得できたか
+      actions … 訴求文のリスト
+      text    … プロンプトに埋め込む文字列
+      reason  … 失敗理由（利用者に表示する。成功時は空文字）
+    取得できなかった場合は既定の1文にフォールバックするが、その事実を
+    reason に載せて呼び出し側から画面に出せるようにする（従来はサーバー
+    ログに出るだけで、利用者からは「機能していない」ようにしか見えなかった）。
+    """
+    def failed(reason: str) -> dict:
+        print(f"[call_to_action] {reason}")
+        return {"ok": False, "actions": [], "skipped": [], "text": DEFAULT_CALL_TO_ACTION, "reason": reason}
+
+    if not (url or "").strip():
+        return failed("スプレッドシートURLが未設定のため、既定の訴求文を使用しました。")
+
+    export_url = _build_csv_export_url(url)
+    if not export_url:
+        return failed("スプレッドシートのURLとして認識できませんでした。共有リンクをそのまま貼り付けてください。")
 
     try:
-        base_match = re.search(r'(https://docs\.google\.com/spreadsheets/d/[a-zA-Z0-9-_]+)/', url)
-        if not base_match:
-            print(f"[call_to_action] URL did not match expected spreadsheet pattern: {url!r}; using default.")
-            return default_action
-
-        base_url = base_match.group(1)
-        gid_match = re.search(r'gid=([0-9]+)', url)
-        gid = gid_match.group(1) if gid_match else "0"
-
-        export_url = f"{base_url}/export?format=csv&gid={gid}"
-
-        req = urllib.request.Request(
-            export_url,
-            headers={"User-Agent": "Mozilla/5.0 (video-review-tool)"}
-        )
+        req = urllib.request.Request(export_url, headers={"User-Agent": "Mozilla/5.0 (video-review-tool)"})
         with urllib.request.urlopen(req, timeout=10) as response:
             content_type = response.headers.get("Content-Type", "")
             raw = response.read()
             final_url = response.geturl()
-
-        # 非公開スプシの場合、GoogleはCSVではなくログインHTMLをHTTP 200で返す。
-        # これを検出してフォールバックし、原因が分かるようにログを残す。
-        head = raw[:512].lstrip().lower()
-        looks_like_html = (
-            "text/html" in content_type.lower()
-            or head.startswith(b"<!doctype html")
-            or b"<html" in head
-            or "accounts.google.com" in final_url
-        )
-        if looks_like_html:
-            print(
-                "[call_to_action] Received an HTML/login response instead of CSV "
-                f"(Content-Type={content_type!r}, final_url={final_url!r}). "
-                "The spreadsheet is likely NOT shared as 'anyone with the link'. Using default action."
-            )
-            return default_action
-
-        csv_data = raw.decode("utf-8", errors="replace")
-        reader = csv.reader(io.StringIO(csv_data))
-        lines = list(reader)
-
-        actions = []
-        for row in lines[3:]:  # 4行目（B4）以降を対象
-            if len(row) < 2:
-                break  # B列が存在しない行に到達したら終了
-            cell = row[1].strip()
-            if not cell:
-                break  # B列が空＝訴求文リストの終端（B11以降の無関係テキストを除外）
-            actions.append(f"・{cell}")
-
-        if not actions:
-            print(
-                f"[call_to_action] CSV parsed but no action rows found in column B from row 4 "
-                f"(rows={len(lines)}). Using default action."
-            )
-            return default_action
-
-        return "\n".join(actions)
-
     except Exception as e:
-        print(f"[call_to_action] Failed to fetch/parse spreadsheet ({type(e).__name__}): {e}. Using default action.")
-        return default_action
+        return failed(f"スプレッドシートを取得できませんでした（{type(e).__name__}）。URLと公開設定を確認してください。")
 
+    # 非公開スプシの場合、GoogleはCSVではなくログインHTMLをHTTP 200で返す。
+    head = raw[:512].lstrip().lower()
+    if ("text/html" in content_type.lower() or head.startswith(b"<!doctype html")
+            or b"<html" in head or "accounts.google.com" in final_url):
+        return failed(
+            "スプレッドシートが非公開のため読み取れませんでした。"
+            "共有設定を「リンクを知っている全員が閲覧可」に変更してください。"
+        )
+
+    try:
+        rows = list(csv.reader(io.StringIO(raw.decode("utf-8", errors="replace"))))
+    except Exception as e:
+        return failed(f"CSVとして解析できませんでした（{type(e).__name__}）。")
+
+    actions, skipped, start_row, col = _extract_actions(rows)
+    if not actions:
+        return failed(
+            f"シートは読み取れましたが、訴求文が1件も見つかりませんでした"
+            f"（{len(rows)}行を確認）。訴求文を縦に並べ、見出しセルに「訴求文」と入れてください。"
+        )
+
+    print(
+        f"[call_to_action] {len(actions)}件の訴求文を取得しました "
+        f"(開始行={start_row + 1}, 列={chr(ord('A') + col)}, 注意書きとして除外={len(skipped)}件)"
+    )
+    return {
+        "ok": True,
+        "actions": actions,
+        "skipped": skipped,
+        "text": "\n".join(f"・{a}" for a in actions),
+        "reason": "",
+    }
+
+
+@app.get("/call-to-action-check")
+def call_to_action_check(url: str = ""):
+    """設定画面から訴求文リストの読み取りを事前確認するための診断用エンドポイント。
+    動画を1本消費しなくても、URLが正しく読めているかをその場で確認できる。"""
+    result = fetch_call_to_action_list(url)
+    return {"ok": result["ok"], "count": len(result["actions"]),
+            "actions": result["actions"], "skipped": result.get("skipped", []),
+            "reason": result["reason"]}
 
 def detect_jetcut_issues(video_path: str) -> List[str]:
     """
@@ -147,12 +326,15 @@ async def analyze_video(
     api_key: str = Form(...),
     ng_words: str = Form("[]"),
     prompt_ja: str = Form(None),
-    spreadsheet_url: str = Form(None)
+    spreadsheet_url: str = Form(None),
+    fps: str = Form(None),
 ):
     try:
         ng_words_list = json.loads(ng_words)
     except Exception:
         ng_words_list = []
+
+    fps_value = resolve_fps(fps)
 
     client = genai.Client(api_key=api_key)
 
@@ -171,117 +353,46 @@ async def analyze_video(
 
     gemini_file = None
     video_size_mb = len(content) / (1024 * 1024)
-    use_inline = video_size_mb < 20  # 20MB未満ならinline_data方式（fps指定可能）
+    # inline_data方式はfps指定ができる反面、リクエスト全体で20MBという上限がある。
+    # inline_dataはbase64エンコードされて約1.33倍に膨らむため、20MB基準にすると
+    # 16MB前後のファイルで上限超過エラーになる。余裕をみて14MBを閾値にする。
+    INLINE_THRESHOLD_MB = 14
+    use_inline = video_size_mb < INLINE_THRESHOLD_MB
 
     try:
         # 1. 音声解析（ジェットカット検出）
         audio_issues = detect_jetcut_issues(tmp_path)
         audio_issues_text = "\n".join(audio_issues) if audio_issues else "無音区間は検出されませんでした。"
+        # pydubによる無音区間の実測結果。Geminiが本当に音声を聞けているかを
+        # 検証する際の「正解データ」として参照する。
+        print(f"[pydub] 無音区間の実測結果:\n{audio_issues_text}")
 
         # 2. 動画の準備（inline_data方式 or File API方式）
         if not use_inline:
-            # 20MB以上の場合はFile APIでアップロード（fps指定不可）
+            # 閾値以上の場合はFile APIでアップロード（fpsは後段のvideo_metadataで指定する）
             gemini_file = client.files.upload(file=tmp_path)
 
+            # PROCESSINGのまま返り続けた場合に無限ループしないよう上限を設ける
+            PROCESSING_TIMEOUT_SEC = 600
+            waited_sec = 0
             while gemini_file.state.name == "PROCESSING":
+                if waited_sec >= PROCESSING_TIMEOUT_SEC:
+                    raise HTTPException(
+                        status_code=504,
+                        detail=f"Geminiの動画処理が{PROCESSING_TIMEOUT_SEC // 60}分以内に完了しませんでした。時間をおいて再度お試しください。",
+                    )
                 time.sleep(2)
+                waited_sec += 2
                 gemini_file = client.files.get(name=gemini_file.name)
 
             if gemini_file.state.name == "FAILED":
                 raise HTTPException(status_code=500, detail="Gemini video processing failed.")
 
-        # 3. プロンプト構築
-        default_prompt_ja = """外注先の動画クリエイターが作成したショート動画（CapCutの編集画面録画）を添削し、フィードバック文を作成してください。
+        # 3. プロンプト構築（デフォルト文言の定義元は prompt.py の1箇所のみ）
+        base_prompt = prompt_ja if prompt_ja else DEFAULT_PROMPT_JA
 
-【重要な前提】
-・この動画はCapCutの編集画面をスマホの画面録画機能で録画したものです。
-・【超重要】あなたは「視覚的なデザインルールが守られているか」だけをチェックする検査官です。AIとしての「内容をもっとこうすれば良くなる」という提案（例：言葉選びの変更、内容の深掘りなど）は絶対にしないでください。すでに金色のテロップになっているものに対して「もっとワクワクする数字を〜」などの指摘を行うのは誤りです。
-・口調は「やさしい中学校の女性教師」のようなやわらかく丁寧な敬語で書いてください。ただし「先生」を自称したり、先生として振る舞う表現は絶対に使わないでください。
-・褒めるところはしっかり褒めつつ、指摘すべき点は具体的に伝えてください。
-・課題の指摘では「具体的なタイムスタンプ（例：0:15あたり）」を文中に含めてください。
-
-【添削基準（全11項目）】
-
-① ジェットカット
-音声の無音区間がないか。間が空いてしまっている箇所はカットして隙間を詰める。ただし重ねすぎて音声同士が被らないように。
-
-② 音声
-雑音やこもりがないか。棒読みにならず抑揚がついているか。聴こえやすい音量か。
-
-③ NGワード
-以下のNGワードが「画面上のテロップ」に含まれていないか確認してください。
-テロップに使う場合は「半角スペース」を入れてAIの検知を回避する必要があります。
-【スペースの入れ方のルール】
-・2文字のNGワード → 間にスペース（例：副業→「副 業」）
-・3文字以上のNGワード → 最小限の箇所に1つだけスペースを入れる（例：収益化→「収 益化」）
-ユーザー定義のNGワードリスト: {ng_words_list}
-
-④ エフェクト
-・1単語だけでなく「1行全体」にエフェクトがかかっているか。
-・ポジティブな言葉にはポジティブなエフェクト、ネガティブな言葉にはネガティブなエフェクト、金額には金・黄色のエフェクトなど、言葉の意味に沿った使い分けができているか。
-・全てのテキストにエフェクトをかけるのではなく、大事な部分や伝えたい部分だけにつける。強弱をつける。
-
-⑤ テロップ背景
-・テロップ（字幕）の背景に敷かれている「帯（背景バー）」の四隅の形状を1つずつ確認してください。判定対象は帯の四隅であり、文字そのものの形ではありません。
-・【判定基準】基準は「直角（角丸半径ゼロの長方形）」です。四隅すべてがほぼ直角（ピシッと尖った90度）に見えるなら正常で、指摘は不要です。
-・【NGの定義】四隅のいずれかに、はっきりと弧を描く丸み（角丸長方形＝角がカーブして削れている状態）が見られる場合のみ「角が丸い」と指摘してください。角丸の半径が帯の高さのおおよそ1割を超えてカーブが明確に視認できる場合がこれに該当します。
-・【誤判定の防止】圧縮ノイズ・低解像度・アンチエイリアス（境界のわずかなぼやけ）で角がわずかに滑らかに見えることがありますが、これは「角丸」ではありません。明確なカーブが確認できない限り直角とみなし、指摘しないでください。判断に迷う中間的なケースは「直角（正常）」として扱ってください。
-・画面枠ギリギリにはみ出していないか。テキスト、挿入画像、スタンプなども枠ギリギリにならないように。
-
-⑥ 画像の挿入
-参考動画に出てくる画像を模倣して適切な画像が挿入されているか。
-
-⑦ 文字数
-・【超重要】このタスクでは「音声を完全にミュートにした状態」を想定してください。音声の書き起こし内容は完全に無視し、AIが視覚的に抽出した画像フレームに「くっきりと映っているテロップ」の文字だけをカウント対象としてください。
-・画面にその瞬間に視覚的に表示されている「1行の文字数」が5〜8文字程度かどうかを判定してください。
-・テロップが切り替わったら「全く別のテロップ」です。前後のテロップを合算して文字数をカウントすることは絶対にやめてください。
-・文字数に問題がない場合は、この項目については何も指摘しないでください。
-
-⑧ 数字ベースの強調
-・訴求部分で数字テキストのみを大きくして強調できているか。他のテキストと同じ大きさはNG。
-・【超重要】ここでは「文字の大きさ」などの視覚的な装飾だけを確認してください。テキストの内容や意味に対するアドバイスは一切不要です。
-
-⑨ 最後の訴求
-以下のリストのいずれかのパターンの構成になっているか確認してください。矢印や線引きスタンプでリンク位置を明確に示しているかどうかも確認してください。
-【許容される訴求文リスト】
-{call_to_action_list}
-
-⑩ その他
-背景素材の切り替えは2秒以内か。素材やテキストにアニメーションをつけているか。
-
-⑪ 誤字脱字
-テロップに誤字脱字がないか、文脈も考慮して確認してください（例：ユニクロ → ニクロ、他社 → 他者 などの誤変換や入力漏れ）。
-
-【事前の無音区間（ジェットカット）検出結果】
-以下はPythonの音声波形解析エンジンによる検出結果です（録画開始・終了時の無音は除外済み）。
-検出された無音区間がある場合は「事実」として、必ずフィードバック文の中でタイムスタンプ付きで指摘してください。
-{audio_issues_text}
-
-【出力形式と構成】
-以下の構成に沿って、パッと見て分かりやすい構造で出力してください。
-マークダウンの記号（# や ** など）は使わず、以下の記号（【】や ■、・）をそのまま使ってプレーンテキストで出力してください。
-
-【総評】
-（動画全体に対するポジティブな感想や、大まかな評価を数行で）
-
-【修正をお願いしたい項目】
-※修正点がない項目は出力しないでください。指摘があるものだけを「■ 項目名」の見出しをつけて箇条書きで記載してください。
-
-■ （指摘項目の名前、例：ジェットカットについて）
-・0:15あたり 〜 （具体的な修正内容）
-
-■ （指摘項目の名前、例：文字数について）
-・0:30あたり 〜 （具体的な修正内容）
-
-【最後に】
-（次回の制作に向けた前向きな締めの言葉）
-
-※そのまま外注先にコピペしてLINE等で送れる、完成された文章にしてください。
-"""
-        
-        base_prompt = prompt_ja if prompt_ja else default_prompt_ja
-
-        call_to_action_text = fetch_call_to_action_list(spreadsheet_url)
+        call_to_action = fetch_call_to_action_list(spreadsheet_url)
+        call_to_action_text = call_to_action["text"]
 
         # 4. プロンプトの英語への翻訳 (実際の指示出しは英語で行う)
         # 【重要】NGワードや訴求文などの日本語データは「翻訳前」に埋め込むと英訳されて壊れる
@@ -300,19 +411,38 @@ async def analyze_video(
             "and call-to-action phrases) must be matched LITERALLY as Japanese; do not expect them in English. "
             "CRITICAL INSTRUCTIONS TO ADD TO THE TRANSLATED PROMPT: "
             "1. NEVER group or summarize errors (e.g., do not say 'Errors are at 0:00, 0:06, 0:37...'). "
-            "2. You MUST list EVERY SINGLE occurrence of an issue individually with its exact timestamp and a detailed explanation of what is wrong and how to fix it. "
-            "3. The final output MUST be entirely in Japanese."
+            "2. You MUST list EVERY SINGLE occurrence of an issue individually with its exact timestamp and a concrete instruction on how to fix it. "
+            "3. The correction list MUST be sorted in chronological order by timestamp (earliest first), mixing all categories together. "
+            "Do NOT create per-category sections or headings. "
+            "4. The final output MUST be entirely in Japanese."
         )
 
         # 1) テンプレートのみ英訳（プレースホルダは保持したまま）
-        translation_response = client.models.generate_content(
-            model='gemini-3.5-flash',
-            contents=[translation_instruction + "\n\n---\n\n" + base_prompt]
-        )
-        prompt_en = translation_response.text.strip()
+        #    同一プロンプトの再翻訳はキャッシュで回避する（コスト・レイテンシ・失敗要因の削減）。
+        required_tokens = ["{ng_words_list}", "{audio_issues_text}", "{call_to_action_list}"]
+        prompt_en = get_cached_translation(base_prompt)
+
+        if prompt_en is not None:
+            print("[translation] Cache HIT — 再翻訳をスキップしました（消費トークン 0）。")
+            translation_usage = {
+                "label": "translation", "prompt": 0, "output": 0, "thoughts": 0,
+                "total": 0, "by_modality": {}, "cached": True,
+            }
+        else:
+            print("[translation] Cache MISS — プロンプトを英訳します。")
+            translation_response = client.models.generate_content(
+                model='gemini-3.5-flash',
+                contents=[translation_instruction + "\n\n---\n\n" + base_prompt]
+            )
+            prompt_en = translation_response.text.strip()
+            translation_usage = summarize_usage(translation_response, "translation")
+            translation_usage["cached"] = False
+
+            # プレースホルダが壊れていない翻訳結果だけをキャッシュする
+            if all(tok in prompt_en for tok in required_tokens):
+                store_translation(base_prompt, prompt_en)
 
         # 2) 翻訳「後」に実データを差し込む（NGワード・訴求文・無音区間を日本語のまま保持）
-        required_tokens = ["{ng_words_list}", "{audio_issues_text}", "{call_to_action_list}"]
         if not all(tok in prompt_en for tok in required_tokens):
             # 翻訳器がプレースホルダを壊した場合は日本語テンプレートにフォールバック
             print("[translation] Placeholder token missing after translation; falling back to JA template.")
@@ -333,34 +463,67 @@ async def analyze_video(
             temperature=0.2  # より確実な（ブレの少ない）判定を行わせるため温度を下げる
         )
 
+        # 動画パートの構築。inline_data / File API のどちらの経路でも video_metadata で
+        # 同じfpsを指定する。以前はFile API経路にfps指定がなく、閾値を超える動画だけ
+        # Geminiの既定値（1fps）で解析されていたため、ファイルサイズによってテロップの
+        # 検出精度が変わってしまっていた。
+        print(f"[fps] サンプリングFPS={fps_value}（{1000 / fps_value:.0f}ms間隔） mode={'inline' if use_inline else 'file_api'}")
+
         if use_inline:
-            # 20MB未満: inline_dataでfps=4を指定（テロップ切り替わりを250msごとに捕捉）
-            response = client.models.generate_content(
-                model='gemini-3.5-flash',
-                contents=types.Content(
-                    parts=[
-                        types.Part(
-                            inline_data=types.Blob(
-                                data=content,
-                                mime_type='video/mp4'),
-                            video_metadata=types.VideoMetadata(fps=4)
-                        ),
-                        types.Part(text=prompt_en)
-                    ]
-                ),
-                config=gen_config
+            video_part = types.Part(
+                inline_data=types.Blob(data=content, mime_type='video/mp4'),
+                video_metadata=types.VideoMetadata(fps=fps_value),
             )
         else:
-            response = client.models.generate_content(
-                model='gemini-3.5-flash',
-                contents=[gemini_file, prompt_en],
-                config=gen_config
+            video_part = types.Part(
+                file_data=types.FileData(
+                    file_uri=gemini_file.uri,
+                    mime_type=gemini_file.mime_type or 'video/mp4',
+                ),
+                video_metadata=types.VideoMetadata(fps=fps_value),
             )
 
+        response = client.models.generate_content(
+            model='gemini-3.5-flash',
+            contents=types.Content(parts=[video_part, types.Part(text=prompt_en)]),
+            config=gen_config
+        )
+
         feedback_text = response.text.strip()
+        analysis_usage = summarize_usage(response, "analysis")
 
-        return {"feedback": feedback_text}
+        # 1本あたりの実測値。translation（プロンプト英訳）とanalysis（動画解析）の合計。
+        total_tokens = translation_usage["total"] + analysis_usage["total"]
+        print(
+            f"[usage:TOTAL] file={video.filename!r} size={video_size_mb:.1f}MB "
+            f"mode={'inline' if use_inline else 'file_api'} fps={fps_value} "
+            f"total={total_tokens:,} tokens "
+            f"(translation={translation_usage['total']:,} + analysis={analysis_usage['total']:,})"
+        )
 
+        return {
+            "feedback": feedback_text,
+            # 訴求文リストが実際に読めたかを画面に返す。読めていないまま既定の1文で
+            # 判定していると「許容されるはずの訴求文が指摘される」ことになるため、
+            # 利用者が気づけるようにする。
+            "call_to_action": {
+                "ok": call_to_action["ok"],
+                "count": len(call_to_action["actions"]),
+                "reason": call_to_action["reason"],
+            },
+            "usage": {
+                "total_tokens": total_tokens,
+                "translation": translation_usage,
+                "analysis": analysis_usage,
+                "video_size_mb": round(video_size_mb, 1),
+                "mode": "inline" if use_inline else "file_api",
+                "fps": fps_value,
+            },
+        }
+
+    except HTTPException:
+        # 意図して投げたHTTPException（413/504など）はステータスコードを保ったまま返す
+        raise
     except Exception as e:
         print("Error during analysis:", e)
         raise HTTPException(status_code=500, detail=str(e))

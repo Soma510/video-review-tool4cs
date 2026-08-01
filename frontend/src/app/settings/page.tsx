@@ -1,95 +1,19 @@
 "use client";
 
 import { useState, useEffect } from "react";
-import { KeyRound, ShieldAlert, Save, Trash2, Plus, CheckCircle2, FileText, RotateCcw } from "lucide-react";
+import { KeyRound, ShieldAlert, Save, Trash2, Plus, CheckCircle2, FileText, RotateCcw, Loader2, Film } from "lucide-react";
+import { fetchDefaultPrompt, checkCallToActionList, type CallToActionCheck } from "@/lib/api";
+import clsx from "clsx";
 
-const DEFAULT_PROMPT = `外注先の動画クリエイターが作成したショート動画（CapCutの編集画面録画）を添削し、フィードバック文を作成してください。
+const DEFAULT_FPS = "4";
 
-【重要な前提】
-・この動画はCapCutの編集画面をスマホの画面録画機能で録画したものです。
-・【超重要】あなたは「視覚的なデザインルールが守られているか」だけをチェックする検査官です。AIとしての「内容をもっとこうすれば良くなる」という提案（例：言葉選びの変更、内容の深掘りなど）は絶対にしないでください。すでに金色のテロップになっているものに対して「もっとワクワクする数字を〜」などの指摘を行うのは誤りです。
-・口調は「やさしい中学校の女性教師」のようなやわらかく丁寧な敬語で書いてください。ただし「先生」を自称したり、先生として振る舞う表現は絶対に使わないでください。
-・褒めるところはしっかり褒めつつ、指摘すべき点は具体的に伝えてください。
-・課題の指摘では「具体的なタイムスタンプ（例：0:15あたり）」を文中に含めてください。
-
-【添削基準（全11項目）】
-
-① ジェットカット
-音声の無音区間がないか。間が空いてしまっている箇所はカットして隙間を詰める。ただし重ねすぎて音声同士が被らないように。
-
-② 音声
-雑音やこもりがないか。棒読みにならず抑揚がついているか。聴こえやすい音量か。
-
-③ NGワード
-以下のNGワードが「画面上のテロップ」に含まれていないか確認してください。
-テロップに使う場合は「半角スペース」を入れてAIの検知を回避する必要があります。
-【スペースの入れ方のルール】
-・2文字のNGワード → 間にスペース（例：副業→「副 業」）
-・3文字以上のNGワード → 最小限の箇所に1つだけスペースを入れる（例：収益化→「収 益化」）
-ユーザー定義のNGワードリスト: {ng_words_list}
-
-④ エフェクト
-・1単語だけでなく「1行全体」にエフェクトがかかっているか。
-・ポジティブな言葉にはポジティブなエフェクト、ネガティブな言葉にはネガティブなエフェクト、金額には金・黄色のエフェクトなど、言葉の意味に沿った使い分けができているか。
-・全てのテキストにエフェクトをかけるのではなく、大事な部分や伝えたい部分だけにつける。強弱をつける。
-
-⑤ テロップ背景
-・テロップ（字幕）の背景に敷かれている「帯（背景バー）」の四隅の形状を1つずつ確認してください。判定対象は帯の四隅であり、文字そのものの形ではありません。
-・【判定基準】基準は「直角（角丸半径ゼロの長方形）」です。四隅すべてがほぼ直角（ピシッと尖った90度）に見えるなら正常で、指摘は不要です。
-・【NGの定義】四隅のいずれかに、はっきりと弧を描く丸み（角丸長方形＝角がカーブして削れている状態）が見られる場合のみ「角が丸い」と指摘してください。角丸の半径が帯の高さのおおよそ1割を超えてカーブが明確に視認できる場合がこれに該当します。
-・【誤判定の防止】圧縮ノイズ・低解像度・アンチエイリアス（境界のわずかなぼやけ）で角がわずかに滑らかに見えることがありますが、これは「角丸」ではありません。明確なカーブが確認できない限り直角とみなし、指摘しないでください。判断に迷う中間的なケースは「直角（正常）」として扱ってください。
-・画面枠ギリギリにはみ出していないか。テキスト、挿入画像、スタンプなども枠ギリギリにならないように。
-
-⑥ 画像の挿入
-参考動画に出てくる画像を模倣して適切な画像が挿入されているか。
-
-⑦ 文字数
-・【超重要】このタスクでは「音声を完全にミュートにした状態」を想定してください。音声の書き起こし内容は完全に無視し、AIが視覚的に抽出した画像フレームに「くっきりと映っているテロップ」の文字だけをカウント対象としてください。
-・画面にその瞬間に視覚的に表示されている「1行の文字数」が5〜8文字程度かどうかを判定してください。
-・テロップが切り替わったら「全く別のテロップ」です。前後のテロップを合算して文字数をカウントすることは絶対にやめてください。
-・文字数に問題がない場合は、この項目については何も指摘しないでください。
-
-⑧ 数字ベースの強調
-・訴求部分で数字テキストのみを大きくして強調できているか。他のテキストと同じ大きさはNG。
-・【超重要】ここでは「文字の大きさ」などの視覚的な装飾だけを確認してください。テキストの内容や意味に対するアドバイスは一切不要です。
-
-⑨ 最後の訴求
-以下のリストのいずれかのパターンの構成になっているか確認してください。矢印や線引きスタンプでリンク位置を明確に示しているかどうかも確認してください。
-【許容される訴求文リスト】
-{call_to_action_list}
-
-⑩ その他
-背景素材の切り替えは2秒以内か。素材やテキストにアニメーションをつけているか。
-
-⑪ 誤字脱字
-テロップに誤字脱字がないか、文脈も考慮して確認してください（例：ユニクロ → ニクロ、他社 → 他者 などの誤変換や入力漏れ）。
-
-【事前の無音区間（ジェットカット）検出結果】
-以下はPythonの音声波形解析エンジンによる検出結果です（録画開始・終了時の無音は除外済み）。
-検出された無音区間がある場合は「事実」として、必ずフィードバック文の中でタイムスタンプ付きで指摘してください。
-{audio_issues_text}
-
-【出力形式と構成】
-以下の構成に沿って、パッと見て分かりやすい構造で出力してください。
-マークダウンの記号（# や ** など）は使わず、以下の記号（【】や ■、・）をそのまま使ってプレーンテキストで出力してください。
-
-【総評】
-（動画全体に対するポジティブな感想や、大まかな評価を数行で）
-
-【修正をお願いしたい項目】
-※修正点がない項目は出力しないでください。指摘があるものだけを「■ 項目名」の見出しをつけて箇条書きで記載してください。
-
-■ （指摘項目の名前、例：ジェットカットについて）
-・0:15あたり 〜 （具体的な修正内容）
-
-■ （指摘項目の名前、例：文字数について）
-・0:30あたり 〜 （具体的な修正内容）
-
-【最後に】
-（次回の制作に向けた前向きな締めの言葉）
-
-※そのまま外注先にコピペしてLINE等で送れる、完成された文章にしてください。
-`;
+/** サンプリングFPSの選択肢。削減率は実測値（動画1本あたり約54,000トークン）から算出。 */
+const FPS_OPTIONS = [
+  { value: "4", label: "4 fps（250ms間隔）", detail: "既定値。テロップ1枚あたり約4フレームを取得します。最も取りこぼしが少ない設定です。" },
+  { value: "3", label: "3 fps（333ms間隔）", detail: "コスト約15%減。テロップ1枚あたり約3フレーム。精度への影響はほぼありません。" },
+  { value: "2", label: "2 fps（500ms間隔）", detail: "コスト約31%減。テロップ1枚あたり約2フレーム。文字数や誤字脱字の判定精度が落ちる可能性があります。" },
+  { value: "1", label: "1 fps（1000ms間隔）", detail: "コスト約46%減。Geminiの既定値ですが、表示の短いテロップを丸ごと取りこぼす恐れがあります。" },
+];
 
 export default function SettingsPage() {
   const [apiKey, setApiKey] = useState("");
@@ -97,27 +21,57 @@ export default function SettingsPage() {
   const [ngWords, setNgWords] = useState<string[]>([]);
   const [newWord, setNewWord] = useState("");
   const [promptJa, setPromptJa] = useState("");
+  const [fps, setFps] = useState(DEFAULT_FPS);
+  const [ctaCheck, setCtaCheck] = useState<CallToActionCheck | null>(null);
+  const [ctaChecking, setCtaChecking] = useState(false);
+  const [promptLoading, setPromptLoading] = useState(false);
+  const [promptError, setPromptError] = useState<string | null>(null);
   const [isSaved, setIsSaved] = useState(false);
 
+  const loadDefaultPrompt = async (): Promise<string | null> => {
+    setPromptLoading(true);
+    setPromptError(null);
+    try {
+      const prompt = await fetchDefaultPrompt();
+      setPromptJa(prompt);
+      return prompt;
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      setPromptError(
+        `デフォルトプロンプトを読み込めませんでした。バックエンドサーバーが起動しているか確認してください。\n詳細: ${detail}`
+      );
+      return null;
+    } finally {
+      setPromptLoading(false);
+    }
+  };
+
   useEffect(() => {
+    // localStorageはサーバー側に存在しないため、レンダリング中に読むとSSRの出力と
+    // 食い違ってhydrationエラーになる。マウント後のeffectで読み込むのが唯一の手段なので
+    // set-state-in-effect ルールはこのeffectに限り無効化する。
+    /* eslint-disable react-hooks/set-state-in-effect */
     const savedApiKey = localStorage.getItem("gemini_api_key");
     const savedSpreadsheetUrl = localStorage.getItem("spreadsheet_url");
     const savedNgWords = localStorage.getItem("ng_words");
     const savedPromptJa = localStorage.getItem("prompt_ja");
-    
+    const savedFps = localStorage.getItem("video_fps");
+
+    if (savedFps && FPS_OPTIONS.some(o => o.value === savedFps)) setFps(savedFps);
     if (savedApiKey) setApiKey(savedApiKey);
     if (savedSpreadsheetUrl) setSpreadsheetUrl(savedSpreadsheetUrl);
     if (savedPromptJa) {
       setPromptJa(savedPromptJa);
     } else {
-      setPromptJa(DEFAULT_PROMPT);
+      // 未保存の場合はバックエンドのデフォルトプロンプトを取得して表示する
+      void loadDefaultPrompt();
     }
-    
+
     if (savedNgWords) {
       try {
         setNgWords(JSON.parse(savedNgWords));
       } catch (e) {
-        console.error("Failed to parse NG words");
+        console.error("Failed to parse NG words", e);
       }
     } else {
       setNgWords([
@@ -134,6 +88,7 @@ export default function SettingsPage() {
         "UPL", "LINE", "ライン", "YouTube", "amazon", "楽天", "消された"
       ]);
     }
+    /* eslint-enable react-hooks/set-state-in-effect */
   }, []);
 
   const handleSaveApiKey = () => {
@@ -144,6 +99,27 @@ export default function SettingsPage() {
   const handleSaveSpreadsheetUrl = () => {
     localStorage.setItem("spreadsheet_url", spreadsheetUrl);
     showSavedNotification();
+    void runCtaCheck(spreadsheetUrl);
+  };
+
+  /** 保存したURLから実際に訴求文が読めるかを確認する（動画を消費せずに検証できる） */
+  const runCtaCheck = async (url: string) => {
+    setCtaChecking(true);
+    setCtaCheck(null);
+    try {
+      setCtaCheck(await checkCallToActionList(url));
+    } catch (error) {
+      const detail = error instanceof Error ? error.message : String(error);
+      setCtaCheck({ ok: false, count: 0, actions: [], skipped: [], reason: `確認できませんでした。バックエンドサーバーが起動しているか確認してください。（${detail}）` });
+    } finally {
+      setCtaChecking(false);
+    }
+  };
+
+  const handleSelectFps = (value: string) => {
+    setFps(value);
+    localStorage.setItem("video_fps", value);
+    showSavedNotification();
   };
 
   const handleSavePrompt = () => {
@@ -151,12 +127,12 @@ export default function SettingsPage() {
     showSavedNotification();
   };
 
-  const handleResetPrompt = () => {
-    if (confirm("プロンプトを初期状態に戻しますか？")) {
-      setPromptJa(DEFAULT_PROMPT);
-      localStorage.setItem("prompt_ja", DEFAULT_PROMPT);
-      showSavedNotification();
-    }
+  const handleResetPrompt = async () => {
+    if (!confirm("プロンプトを初期状態に戻しますか？")) return;
+    const prompt = await loadDefaultPrompt();
+    if (prompt === null) return; // 取得に失敗した場合は現在の内容を壊さない
+    localStorage.setItem("prompt_ja", prompt);
+    showSavedNotification();
   };
 
   const handleSaveNgWords = (words: string[]) => {
@@ -238,7 +214,9 @@ export default function SettingsPage() {
             <h2 className="text-sm font-bold text-[#333333]">訴求文リスト (Spreadsheet URL)</h2>
           </div>
           <p className="text-xs text-[#666666] mb-4">
-            最後の訴求文のチェックに使用するGoogleスプレッドシートのURLを入力してください。（※「リンクを知っている全員」が閲覧可能になっている必要があります）
+            最後の訴求文のチェックに使用するGoogleスプレッドシートのURLを入力してください。ここに載っていない訴求文が使われていた場合に指摘されます。<br />
+            ※ 共有設定を「<strong className="text-[#333333]">リンクを知っている全員</strong>」が閲覧可にしてください。非公開だと読み取れません。<br />
+            ※ 訴求文は縦に並べ、見出しのセルに「<strong className="text-[#333333]">訴求文</strong>」と入れてください（見出しが無い場合はB列4行目以降を読みます）。
           </p>
           <div className="flex flex-col sm:flex-row gap-3">
             <input
@@ -250,11 +228,101 @@ export default function SettingsPage() {
             />
             <button
               onClick={handleSaveSpreadsheetUrl}
-              className="bg-[#2C4A73] hover:bg-[#1E3A8A] text-white px-6 py-2 rounded text-sm font-bold flex items-center transition-colors shadow-sm"
+              disabled={ctaChecking}
+              className="bg-[#2C4A73] hover:bg-[#1E3A8A] text-white px-6 py-2 rounded text-sm font-bold flex items-center transition-colors shadow-sm disabled:opacity-60"
             >
-              <Save className="w-4 h-4 mr-2" />
-              保存
+              {ctaChecking ? <Loader2 className="w-4 h-4 mr-2 animate-spin" /> : <Save className="w-4 h-4 mr-2" />}
+              保存して確認
             </button>
+          </div>
+
+          {/* 読み取り結果。ここで確認できないと「動かない理由」が分からないまま使い続けることになる */}
+          {ctaChecking && (
+            <div className="mt-3 text-xs text-[#666666] flex items-center">
+              <Loader2 className="w-3.5 h-3.5 mr-2 animate-spin" />
+              スプレッドシートを読み取っています...
+            </div>
+          )}
+          {!ctaChecking && ctaCheck && (
+            <div
+              className={clsx(
+                "mt-3 p-3 rounded border-l-4 text-xs",
+                ctaCheck.ok ? "bg-[#F1F8F1] border-[#5CB85C]" : "bg-[#FDF2F2] border-[#D9534F]"
+              )}
+            >
+              {ctaCheck.ok ? (
+                <>
+                  <div className="flex items-center font-bold text-[#333333] mb-2">
+                    <CheckCircle2 className="w-4 h-4 mr-1.5 text-[#5CB85C]" />
+                    訴求文を{ctaCheck.count}件読み取りました
+                  </div>
+                  <ul className="space-y-0.5 text-[#4A4A4A]">
+                    {ctaCheck.actions.map((action, i) => (
+                      <li key={i}>・{action}</li>
+                    ))}
+                  </ul>
+                  <p className="text-[#999999] mt-2">この一覧に無い訴求文が使われていた場合に指摘されます。過不足があればシートを修正して、もう一度確認してください。</p>
+                  {ctaCheck.skipped.length > 0 && (
+                    <div className="mt-2 pt-2 border-t border-[#D7E7D7]">
+                      <p className="text-[#666666] font-bold mb-1">注意書きとして除外した行（{ctaCheck.skipped.length}件）</p>
+                      <ul className="space-y-0.5 text-[#999999]">
+                        {ctaCheck.skipped.map((s, i) => (
+                          <li key={i} className="line-clamp-2">・{s}</li>
+                        ))}
+                      </ul>
+                      <p className="text-[#999999] mt-1">訴求文ではないと判断したため、判定には使いません。もし訴求文だった場合は、行頭の記号（⚠️や※）を外してください。</p>
+                    </div>
+                  )}
+                </>
+              ) : (
+                <>
+                  <div className="flex items-center font-bold text-[#333333] mb-1">
+                    <ShieldAlert className="w-4 h-4 mr-1.5 text-[#D9534F]" />
+                    訴求文リストを読み取れませんでした
+                  </div>
+                  <p className="text-[#4A4A4A]">{ctaCheck.reason}</p>
+                  <p className="text-[#999999] mt-2">このままチェックを実行すると、既定の訴求文1件だけで判定するため、本来は許容されるはずの訴求文まで指摘されます。</p>
+                </>
+              )}
+            </div>
+          )}
+        </div>
+
+        {/* Sampling FPS Section */}
+        <div className="bg-white rounded border border-[#E5E5E5] p-4 sm:p-6 shadow-sm">
+          <div className="flex items-center mb-4">
+            <Film className="w-5 h-5 text-[#2C4A73] mr-2" />
+            <h2 className="text-sm font-bold text-[#333333]">解析の細かさ（サンプリングFPS）</h2>
+          </div>
+          <p className="text-xs text-[#666666] mb-4">
+            動画を1秒あたり何コマ切り出してAIに渡すかの設定です。細かくするほどテロップの切り替わりを正確に捉えられますが、その分コストが上がります。<br />
+            消費トークンのうち約8割が動画のコマ分なので、<strong className="text-[#333333]">この設定がコストにほぼ直結します</strong>。
+          </p>
+          <div className="space-y-2">
+            {FPS_OPTIONS.map(option => (
+              <label
+                key={option.value}
+                className={clsx(
+                  "flex items-start p-3 rounded border cursor-pointer transition-colors",
+                  fps === option.value
+                    ? "border-[#2C4A73] bg-[#F4F6F8]"
+                    : "border-[#E5E5E5] bg-[#FAF9F6] hover:bg-[#F5F4F0]"
+                )}
+              >
+                <input
+                  type="radio"
+                  name="fps"
+                  value={option.value}
+                  checked={fps === option.value}
+                  onChange={() => handleSelectFps(option.value)}
+                  className="mt-0.5 mr-3 accent-[#2C4A73]"
+                />
+                <span className="flex-1">
+                  <span className="block text-sm font-bold text-[#333333]">{option.label}</span>
+                  <span className="block text-xs text-[#666666] mt-0.5">{option.detail}</span>
+                </span>
+              </label>
+            ))}
           </div>
         </div>
 
@@ -266,25 +334,34 @@ export default function SettingsPage() {
           </div>
           <p className="text-xs text-[#666666] mb-4">
             AIへの指示内容を日本語で編集できます。ここに入力された内容は、分析実行時に自動的に最適な英語に翻訳されてAIに渡されます。<br/>
-            ※ <code>{'{ng_words_list}'}</code> や <code>{'{audio_issues_text}'}</code> の部分は、実行時に実際の内容に自動置換されます。そのまま残してください。
+            ※ <code>{'{ng_words_list}'}</code>、<code>{'{audio_issues_text}'}</code>、<code>{'{call_to_action_list}'}</code> の部分は、実行時に実際の内容に自動置換されます。そのまま残してください。
           </p>
+          {promptError && (
+            <div className="mb-3 bg-[#FDF2F2] border-l-4 border-[#D9534F] px-3 py-2 rounded text-xs text-[#333333] whitespace-pre-wrap">
+              {promptError}
+            </div>
+          )}
           <div className="flex flex-col gap-3">
             <textarea
               value={promptJa}
               onChange={(e) => setPromptJa(e.target.value)}
-              className="w-full bg-[#FAF9F6] border border-[#E5E5E5] text-[#333333] rounded px-3 py-2 text-sm focus:outline-none focus:border-[#2C4A73] font-mono min-h-[300px] resize-y"
+              disabled={promptLoading}
+              placeholder={promptLoading ? "デフォルトプロンプトを読み込み中です..." : ""}
+              className="w-full bg-[#FAF9F6] border border-[#E5E5E5] text-[#333333] rounded px-3 py-2 text-sm focus:outline-none focus:border-[#2C4A73] font-mono min-h-[300px] resize-y disabled:opacity-60"
             />
             <div className="flex justify-end gap-2">
               <button
                 onClick={handleResetPrompt}
-                className="bg-white hover:bg-[#FAF9F6] text-[#666666] border border-[#CCCCCC] px-4 py-2 rounded text-sm font-bold flex items-center transition-colors shadow-sm"
+                disabled={promptLoading}
+                className="bg-white hover:bg-[#FAF9F6] text-[#666666] border border-[#CCCCCC] px-4 py-2 rounded text-sm font-bold flex items-center transition-colors shadow-sm disabled:opacity-60"
               >
-                <RotateCcw className="w-4 h-4 mr-2" />
+                {promptLoading ? <Loader2 className="w-4 h-4 mr-2 animate-spin" /> : <RotateCcw className="w-4 h-4 mr-2" />}
                 初期状態に戻す
               </button>
               <button
                 onClick={handleSavePrompt}
-                className="bg-[#2C4A73] hover:bg-[#1E3A8A] text-white px-6 py-2 rounded text-sm font-bold flex items-center transition-colors shadow-sm"
+                disabled={promptLoading || !promptJa}
+                className="bg-[#2C4A73] hover:bg-[#1E3A8A] text-white px-6 py-2 rounded text-sm font-bold flex items-center transition-colors shadow-sm disabled:opacity-60"
               >
                 <Save className="w-4 h-4 mr-2" />
                 保存

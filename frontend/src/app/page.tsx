@@ -1,8 +1,32 @@
 "use client";
 
 import { useState, useEffect, useRef } from "react";
-import { Upload, FileVideo, Play, CheckCircle2, Loader2, Copy, AlertTriangle, Trash2, Clock, ChevronDown, ChevronUp } from "lucide-react";
+import { Upload, CheckCircle2, Loader2, Copy, AlertTriangle, Trash2, ChevronDown, ChevronRight } from "lucide-react";
+import { getApiUrl } from "@/lib/api";
 import clsx from "clsx";
+
+/** 1本あたりの消費トークン実測値（コスト試算用） */
+interface UsageInfo {
+  total_tokens: number;
+  video_size_mb: number;
+  mode: string;
+  fps: number;
+  translation: { total: number };
+  analysis: {
+    total: number;
+    prompt: number;
+    output: number;
+    thoughts: number;
+    by_modality: Record<string, number>;
+  };
+}
+
+/** 訴求文リスト（スプレッドシート）の読み取り結果 */
+interface CallToActionInfo {
+  ok: boolean;
+  count: number;
+  reason: string;
+}
 
 interface ReviewItem {
   id: string;
@@ -11,76 +35,117 @@ interface ReviewItem {
   feedback: string;
   errorMessage: string | null;
   timestamp: string;
+  usage?: UsageInfo;
+  callToAction?: CallToActionInfo;
 }
 
-const HISTORY_KEY = "review_history";
-const ACTIVE_KEY = "active_reviews";
+// チェック結果は完了時点で自動保存され、この1つのキーだけで管理する。
+// 以前は「実行中(active_reviews)」と「履歴(review_history)」の2つに分かれており、
+// 手動で「履歴に保存」「復元」を行き来する必要があったが、その概念は廃止した。
+const REVIEWS_KEY = "reviews";
+const LEGACY_ACTIVE_KEY = "active_reviews";
+const LEGACY_HISTORY_KEY = "review_history";
+const MAX_REVIEWS = 50;
 
-function loadHistory(): ReviewItem[] {
+const INTERRUPTED_MESSAGE =
+  "【エラー】画面が切り替わったため通信が中断されました。再度アップロードしてください。";
+
+/** 実行中のまま復元された項目は通信が切れているのでエラー扱いにする。あわせてidの重複を除く。 */
+function normalize(items: ReviewItem[]): ReviewItem[] {
+  const seen = new Set<string>();
+  const result: ReviewItem[] = [];
+  for (const item of items) {
+    if (!item || typeof item.id !== "string" || seen.has(item.id)) continue;
+    seen.add(item.id);
+    result.push(
+      item.status === "uploading"
+        ? { ...item, status: "error" as const, errorMessage: INTERRUPTED_MESSAGE }
+        : item
+    );
+  }
+  return result;
+}
+
+function loadReviews(): ReviewItem[] {
   if (typeof window === "undefined") return [];
   try {
-    const raw = localStorage.getItem(HISTORY_KEY);
-    return raw ? JSON.parse(raw) : [];
-  } catch {
+    const raw = localStorage.getItem(REVIEWS_KEY);
+    if (raw) return normalize(JSON.parse(raw));
+
+    // 旧バージョンの2キーからの移行（実行中→履歴の順に並べ直して1本化する）
+    const legacyActive: ReviewItem[] = JSON.parse(localStorage.getItem(LEGACY_ACTIVE_KEY) || "[]");
+    const legacyHistory: ReviewItem[] = JSON.parse(localStorage.getItem(LEGACY_HISTORY_KEY) || "[]");
+    const merged = normalize([...legacyActive, ...legacyHistory]).slice(0, MAX_REVIEWS);
+    if (merged.length > 0) {
+      // 新キーへ確定保存してから旧キーを消す（移行途中で失われないように）
+      localStorage.setItem(REVIEWS_KEY, JSON.stringify(merged));
+      localStorage.removeItem(LEGACY_ACTIVE_KEY);
+      localStorage.removeItem(LEGACY_HISTORY_KEY);
+    }
+    return merged;
+  } catch (e) {
+    console.error("Failed to load reviews", e);
     return [];
   }
 }
 
-function saveHistory(items: ReviewItem[]) {
-  localStorage.setItem(HISTORY_KEY, JSON.stringify(items));
-}
-
 export default function DashboardPage() {
-  const [activeReviews, setActiveReviews] = useState<ReviewItem[]>([]);
-  const [history, setHistory] = useState<ReviewItem[]>([]);
+  const [reviews, setReviews] = useState<ReviewItem[]>([]);
   const [copiedId, setCopiedId] = useState<string | null>(null);
-  const [historyOpen, setHistoryOpen] = useState(false);
+  // 折りたたみの明示的な切り替え。未指定の項目は「最新の1件だけ開く」を既定とする。
+  const [expandedOverride, setExpandedOverride] = useState<Record<string, boolean>>({});
+  // localStorageからの復元が終わるまで保存側のeffectを走らせないためのフラグ。
+  // これがないと、復元前の空配列がlocalStorageを上書きして結果が消える。
+  const [hydrated, setHydrated] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
-    setHistory(loadHistory());
-
-    // リロード時にactiveReviewsを復元する
+    // localStorageはサーバー側に存在しないため、レンダリング中に読むとSSRの出力と
+    // 食い違ってhydrationエラーになる。マウント後のeffectで読み込むのが唯一の手段。
     try {
-      const rawActive = localStorage.getItem(ACTIVE_KEY);
-      if (rawActive) {
-        const parsedActive: ReviewItem[] = JSON.parse(rawActive);
-        // アップロード中にリロードされた場合、通信が切れているためエラー状態に変更する
-        const restoredActive = parsedActive.map(item => 
-          item.status === "uploading" 
-            ? { ...item, status: "error" as const, errorMessage: "【エラー】画面が切り替わったため通信が中断されました。再度アップロードしてください。" } 
-            : item
-        );
-        setActiveReviews(restoredActive);
-      }
-    } catch (e) {
-      console.error("Failed to load active reviews", e);
+      setReviews(loadReviews());
+    } finally {
+      setHydrated(true);
     }
   }, []);
 
   useEffect(() => {
-    // activeReviewsが変更されるたびに保存する
-    localStorage.setItem(ACTIVE_KEY, JSON.stringify(activeReviews));
-  }, [activeReviews]);
+    // チェック結果は変更のたびに自動保存する（復元完了後のみ）。
+    // 完了時点で保存されるため、利用者が保存操作を行う必要はない。
+    if (!hydrated) return;
+    try {
+      localStorage.setItem(REVIEWS_KEY, JSON.stringify(reviews));
+    } catch (e) {
+      console.error("Failed to save reviews", e);
+    }
+  }, [reviews, hydrated]);
+
+  const addReview = (item: ReviewItem) => {
+    setReviews(prev => [item, ...prev].slice(0, MAX_REVIEWS));
+  };
+
+  const patchReview = (id: string, patch: Partial<ReviewItem>) => {
+    setReviews(prev => prev.map(r => (r.id === id ? { ...r, ...patch } : r)));
+  };
 
   const startReview = async (file: File) => {
     const apiKey = localStorage.getItem("gemini_api_key");
     if (!apiKey) {
-      const errorItem: ReviewItem = {
+      addReview({
         id: crypto.randomUUID(),
         fileName: file.name,
         status: "error",
         feedback: "",
         errorMessage: "システム設定からGemini APIキーを登録してください。",
         timestamp: new Date().toLocaleString("ja-JP"),
-      };
-      setActiveReviews(prev => [errorItem, ...prev]);
+      });
       return;
     }
 
     const ngWords = localStorage.getItem("ng_words") || "[]";
     const promptJa = localStorage.getItem("prompt_ja") || "";
     const spreadsheetUrl = localStorage.getItem("spreadsheet_url") || "";
+    const fps = localStorage.getItem("video_fps") || "";
 
     const newItem: ReviewItem = {
       id: crypto.randomUUID(),
@@ -91,7 +156,7 @@ export default function DashboardPage() {
       timestamp: new Date().toLocaleString("ja-JP"),
     };
 
-    setActiveReviews(prev => [newItem, ...prev]);
+    addReview(newItem);
 
     try {
       const formData = new FormData();
@@ -104,10 +169,11 @@ export default function DashboardPage() {
       if (spreadsheetUrl) {
         formData.append("spreadsheet_url", spreadsheetUrl);
       }
+      if (fps) {
+        formData.append("fps", fps);
+      }
 
-      const rawApiUrl = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
-      const apiUrl = rawApiUrl.replace(/\/$/, "");
-      const response = await fetch(`${apiUrl}/analyze`, {
+      const response = await fetch(`${getApiUrl()}/analyze`, {
         method: "POST",
         body: formData,
       });
@@ -124,23 +190,20 @@ export default function DashboardPage() {
 
       const data = await response.json();
 
-      setActiveReviews(prev =>
-        prev.map(r =>
-          r.id === newItem.id ? { ...r, status: "done" as const, feedback: data.feedback } : r
-        )
-      );
-    } catch (error: any) {
-      let errMsg: string;
-      if (error.message.includes("Failed to fetch") || error.message.includes("NetworkError")) {
-        errMsg = "【通信エラー】\nバックエンドサーバーに接続できませんでした。サーバーが起動しているか確認してください。";
-      } else {
-        errMsg = `エラーが発生しました。\n\n詳細:\n${error.message}`;
-      }
-      setActiveReviews(prev =>
-        prev.map(r =>
-          r.id === newItem.id ? { ...r, status: "error" as const, errorMessage: errMsg } : r
-        )
-      );
+      // 完了した時点で自動保存される（保存用effectが走る）
+      patchReview(newItem.id, {
+        status: "done",
+        feedback: data.feedback,
+        usage: data.usage,
+        callToAction: data.call_to_action,
+      });
+    } catch (error: unknown) {
+      const message = error instanceof Error ? error.message : String(error);
+      const errMsg =
+        message.includes("Failed to fetch") || message.includes("NetworkError")
+          ? "【通信エラー】\nバックエンドサーバーに接続できませんでした。サーバーが起動しているか確認してください。"
+          : `エラーが発生しました。\n\n詳細:\n${message}`;
+      patchReview(newItem.id, { status: "error", errorMessage: errMsg });
     }
   };
 
@@ -151,55 +214,34 @@ export default function DashboardPage() {
     }
   };
 
-  const updateFeedback = (id: string, newText: string) => {
-    setActiveReviews(prev =>
-      prev.map(r => (r.id === id ? { ...r, feedback: newText } : r))
-    );
-  };
-
   const copyToClipboard = (id: string, text: string) => {
     navigator.clipboard.writeText(text);
     setCopiedId(id);
     setTimeout(() => setCopiedId(null), 2000);
   };
 
-  const saveToHistory = (item: ReviewItem) => {
-    const updated = [item, ...history.filter(h => h.id !== item.id)].slice(0, 50);
-    setHistory(updated);
-    saveHistory(updated);
-    setActiveReviews(prev => prev.filter(r => r.id !== item.id));
+  const removeReview = (item: ReviewItem) => {
+    if (!confirm(`「${item.fileName}」のチェック結果を削除しますか？\nこの操作は取り消せません。`)) return;
+    setReviews(prev => prev.filter(r => r.id !== item.id));
   };
 
-  const removeFromActive = (id: string) => {
-    setActiveReviews(prev => prev.filter(r => r.id !== id));
-  };
-
-  const restoreFromHistory = (item: ReviewItem) => {
-    setActiveReviews(prev => [item, ...prev]);
-    const updated = history.filter(h => h.id !== item.id);
-    setHistory(updated);
-    saveHistory(updated);
-  };
-
-  const removeFromHistory = (id: string) => {
-    const updated = history.filter(h => h.id !== id);
-    setHistory(updated);
-    saveHistory(updated);
+  const toggleExpanded = (id: string, current: boolean) => {
+    setExpandedOverride(prev => ({ ...prev, [id]: !current }));
   };
 
   return (
     <div className="p-4 sm:p-8 max-w-[1000px] mx-auto w-full">
       <div className="mb-6 flex items-end justify-between border-b border-[#E5E5E5] pb-4">
         <div>
-          <h1 className="text-xl font-bold text-[#333333] mb-1">動画添削ダッシュボード</h1>
-          <p className="text-[#666666] text-xs">外注先から提出されたCapCut編集動画をAIで自動解析します。</p>
+          <h1 className="text-xl font-bold text-[#333333] mb-1">動画チェック</h1>
+          <p className="text-[#666666] text-xs">自分が編集したCapCutの画面録画をAIでチェックします。結果は自動で保存されます。</p>
         </div>
       </div>
 
       <div className="space-y-6">
         {/* Upload Section */}
         <div className="bg-white rounded border border-[#E5E5E5] p-4 sm:p-6 shadow-sm">
-          <h2 className="text-sm font-bold text-[#333333] border-l-4 border-[#2C4A73] pl-2 mb-4">対象動画のアップロード</h2>
+          <h2 className="text-sm font-bold text-[#333333] border-l-4 border-[#2C4A73] pl-2 mb-4">動画のアップロード</h2>
           <div className="flex flex-col sm:flex-row gap-4">
             <label className="cursor-pointer flex flex-col items-center justify-center flex-1 h-32 border-2 border-dashed border-[#DCD9D0] bg-[#FAF9F6] rounded hover:bg-[#F5F4F0] transition-colors">
               <Upload className="w-6 h-6 text-[#2C4A73] mb-2" />
@@ -217,23 +259,39 @@ export default function DashboardPage() {
           </div>
         </div>
 
-        {/* Active Reviews */}
-        {activeReviews.map(item => (
-          <div key={item.id} className="bg-white rounded border border-[#E5E5E5] shadow-sm overflow-hidden">
-            {/* Header */}
-            <div className="px-4 sm:px-6 py-3 border-b border-[#E5E5E5] bg-[#FAF9F6] flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3 sm:gap-0">
-              <div className="flex items-center space-x-3 w-full sm:w-auto">
-                {item.status === "uploading" && <Loader2 className="w-4 h-4 text-[#2C4A73] animate-spin" />}
-                {item.status === "done" && <CheckCircle2 className="w-4 h-4 text-[#5CB85C]" />}
-                {item.status === "error" && <AlertTriangle className="w-4 h-4 text-[#D9534F]" />}
-                <div>
-                  <span className="text-sm font-bold text-[#333333]">{item.fileName}</span>
-                  <span className="text-xs text-[#999999] ml-3">{item.timestamp}</span>
+        {/* Reviews（完了時点で自動保存。手動の保存・復元操作は不要） */}
+        {reviews.map((item, index) => {
+          // 既定では最新の1件だけ開いた状態にし、それ以外は折りたたむ
+          const isExpanded = expandedOverride[item.id] ?? index === 0;
+          const collapsible = item.status === "done";
+
+          return (
+            <div key={item.id} className="bg-white rounded border border-[#E5E5E5] shadow-sm overflow-hidden">
+              {/* Header */}
+              <div
+                className={clsx(
+                  "px-4 sm:px-6 py-3 border-b border-[#E5E5E5] bg-[#FAF9F6] flex flex-col sm:flex-row items-start sm:items-center justify-between gap-3 sm:gap-0",
+                  collapsible && "cursor-pointer hover:bg-[#F5F4F0] transition-colors"
+                )}
+                onClick={collapsible ? () => toggleExpanded(item.id, isExpanded) : undefined}
+              >
+                <div className="flex items-center space-x-3 w-full sm:w-auto">
+                  {collapsible &&
+                    (isExpanded ? (
+                      <ChevronDown className="w-4 h-4 text-[#999999] shrink-0" />
+                    ) : (
+                      <ChevronRight className="w-4 h-4 text-[#999999] shrink-0" />
+                    ))}
+                  {item.status === "uploading" && <Loader2 className="w-4 h-4 text-[#2C4A73] animate-spin" />}
+                  {item.status === "done" && <CheckCircle2 className="w-4 h-4 text-[#5CB85C]" />}
+                  {item.status === "error" && <AlertTriangle className="w-4 h-4 text-[#D9534F]" />}
+                  <div>
+                    <span className="text-sm font-bold text-[#333333]">{item.fileName}</span>
+                    <span className="text-xs text-[#999999] ml-3">{item.timestamp}</span>
+                  </div>
                 </div>
-              </div>
-              <div className="flex items-center space-x-2">
-                {item.status === "done" && (
-                  <>
+                <div className="flex items-center space-x-2" onClick={(e) => e.stopPropagation()}>
+                  {item.status === "done" && (
                     <button
                       onClick={() => copyToClipboard(item.id, item.feedback)}
                       className="flex items-center text-xs bg-white border border-[#CCCCCC] hover:bg-[#FAF9F6] text-[#333333] px-3 py-1.5 rounded shadow-sm font-medium transition-colors"
@@ -241,102 +299,77 @@ export default function DashboardPage() {
                       {copiedId === item.id ? <CheckCircle2 className="w-3.5 h-3.5 mr-1.5 text-[#5CB85C]" /> : <Copy className="w-3.5 h-3.5 mr-1.5" />}
                       {copiedId === item.id ? "コピーしました" : "コピー"}
                     </button>
+                  )}
+                  {item.status !== "uploading" && (
                     <button
-                      onClick={() => saveToHistory(item)}
-                      className="flex items-center text-xs bg-white border border-[#CCCCCC] hover:bg-[#FAF9F6] text-[#333333] px-3 py-1.5 rounded shadow-sm font-medium transition-colors"
+                      onClick={() => removeReview(item)}
+                      className="text-[#CCCCCC] hover:text-[#D9534F] transition-colors p-1"
+                      title="削除"
                     >
-                      <Clock className="w-3.5 h-3.5 mr-1.5" />
-                      履歴に保存
+                      <Trash2 className="w-4 h-4" />
                     </button>
-                  </>
-                )}
-                {item.status !== "uploading" && (
-                  <button
-                    onClick={() => removeFromActive(item.id)}
-                    className="text-[#CCCCCC] hover:text-[#D9534F] transition-colors p-1"
-                    title="閉じる"
-                  >
-                    <Trash2 className="w-4 h-4" />
-                  </button>
-                )}
+                  )}
+                </div>
               </div>
-            </div>
 
-            {/* Body */}
-            <div className="p-4 sm:p-6">
-              {item.status === "uploading" && (
-                <div className="flex items-center justify-center py-8 text-[#666666] text-sm">
-                  <Loader2 className="w-5 h-5 mr-3 animate-spin text-[#2C4A73]" />
-                  AI添削を実行中です。しばらくお待ちください...
+              {/* Body */}
+              {(item.status !== "done" || isExpanded) && (
+                <div className="p-4 sm:p-6">
+                  {item.status === "uploading" && (
+                    <div className="flex items-center justify-center py-8 text-[#666666] text-sm">
+                      <Loader2 className="w-5 h-5 mr-3 animate-spin text-[#2C4A73]" />
+                      AIチェックを実行中です。しばらくお待ちください...
+                    </div>
+                  )}
+                  {item.status === "error" && item.errorMessage && (
+                    <div className="bg-[#FDF2F2] border-l-4 border-[#D9534F] p-4 rounded">
+                      <div className="text-sm text-[#333333] whitespace-pre-wrap font-mono bg-white p-3 rounded border border-[#F5C6CB] select-all">
+                        {item.errorMessage}
+                      </div>
+                    </div>
+                  )}
+                  {item.status === "done" && (
+                    <>
+                      {item.callToAction && !item.callToAction.ok && (
+                        <div className="mb-3 bg-[#FFF8E1] border-l-4 border-[#E0A800] p-3 rounded text-xs">
+                          <div className="font-bold text-[#333333] mb-1 flex items-center">
+                            <AlertTriangle className="w-3.5 h-3.5 mr-1.5 text-[#E0A800]" />
+                            訴求文リストを読み取れませんでした
+                          </div>
+                          <p className="text-[#4A4A4A]">{item.callToAction.reason}</p>
+                          <p className="text-[#856404] mt-1">
+                            「最後の訴求」の指摘は既定の1件だけで判定しているため、本来は許容される訴求文まで指摘されている可能性があります。システム設定でURLを確認してください。
+                          </p>
+                        </div>
+                      )}
+                      <textarea
+                        value={item.feedback}
+                        onChange={(e) => patchReview(item.id, { feedback: e.target.value })}
+                        className="w-full bg-[#FAF9F6] rounded border border-[#E5E5E5] p-5 text-[#333333] text-sm leading-relaxed resize-y min-h-[200px] focus:outline-none focus:border-[#2C4A73]"
+                        rows={Math.max(10, item.feedback.split("\n").length + 2)}
+                      />
+                      {item.usage && (
+                        <div className="mt-3 text-xs text-[#999999] font-mono border-t border-[#E5E5E5] pt-2 leading-relaxed">
+                          消費トークン <span className="text-[#666666] font-bold">{item.usage.total_tokens.toLocaleString()}</span>
+                          {"　"}（動画解析 {item.usage.analysis.total.toLocaleString()} ／ プロンプト英訳 {item.usage.translation.total.toLocaleString()}）
+                          <br />
+                          内訳: 入力 {item.usage.analysis.prompt.toLocaleString()}
+                          {Object.entries(item.usage.analysis.by_modality).length > 0 && (
+                            <> [{Object.entries(item.usage.analysis.by_modality).map(([k, v]) => `${k} ${v.toLocaleString()}`).join(" / ")}]</>
+                          )}
+                          {" ／ 思考 "}{item.usage.analysis.thoughts.toLocaleString()}
+                          {" ／ 出力 "}{item.usage.analysis.output.toLocaleString()}
+                          {"　"}{item.usage.video_size_mb}MB・{item.usage.mode}
+                          {item.usage.fps ? `・${item.usage.fps}fps` : ""}
+                        </div>
+                      )}
+                    </>
+                  )}
                 </div>
               )}
-              {item.status === "error" && item.errorMessage && (
-                <div className="bg-[#FDF2F2] border-l-4 border-[#D9534F] p-4 rounded">
-                  <div className="text-sm text-[#333333] whitespace-pre-wrap font-mono bg-white p-3 rounded border border-[#F5C6CB] select-all">
-                    {item.errorMessage}
-                  </div>
-                </div>
-              )}
-              {item.status === "done" && (
-                <textarea
-                  value={item.feedback}
-                  onChange={(e) => updateFeedback(item.id, e.target.value)}
-                  className="w-full bg-[#FAF9F6] rounded border border-[#E5E5E5] p-5 text-[#333333] text-sm leading-relaxed resize-y min-h-[200px] focus:outline-none focus:border-[#2C4A73]"
-                  rows={Math.max(10, item.feedback.split("\n").length + 2)}
-                />
-              )}
             </div>
-          </div>
-        ))}
-
-        {/* History Section */}
-        {history.length > 0 && (
-          <div className="bg-white rounded border border-[#E5E5E5] shadow-sm overflow-hidden">
-            <button
-              onClick={() => setHistoryOpen(!historyOpen)}
-              className="w-full px-4 sm:px-6 py-4 bg-[#FAF9F6] flex items-center justify-between hover:bg-[#F5F4F0] transition-colors"
-            >
-              <h2 className="text-sm font-bold text-[#333333] flex items-center">
-                <Clock className="w-4 h-4 mr-2 text-[#2C4A73]" />
-                添削履歴（{history.length}件）
-              </h2>
-              {historyOpen ? <ChevronUp className="w-4 h-4 text-[#999999]" /> : <ChevronDown className="w-4 h-4 text-[#999999]" />}
-            </button>
-
-            {historyOpen && (
-              <div className="divide-y divide-[#E5E5E5]">
-                {history.map(item => (
-                  <div key={item.id} className="px-4 sm:px-6 py-3 flex items-center justify-between hover:bg-[#FAF9F6]">
-                    <div className="flex-1 min-w-0">
-                      <span className="text-sm font-medium text-[#333333] truncate block">{item.fileName}</span>
-                      <span className="text-xs text-[#999999]">{item.timestamp}</span>
-                    </div>
-                    <div className="flex items-center space-x-2 ml-4">
-                      <button
-                        onClick={() => copyToClipboard(item.id, item.feedback)}
-                        className="text-xs bg-white border border-[#CCCCCC] hover:bg-[#FAF9F6] text-[#333333] px-2 py-1 rounded font-medium transition-colors"
-                      >
-                        {copiedId === item.id ? "コピー済" : "コピー"}
-                      </button>
-                      <button
-                        onClick={() => restoreFromHistory(item)}
-                        className="text-xs bg-white border border-[#CCCCCC] hover:bg-[#FAF9F6] text-[#333333] px-2 py-1 rounded font-medium transition-colors"
-                      >
-                        復元
-                      </button>
-                      <button
-                        onClick={() => removeFromHistory(item.id)}
-                        className="text-[#CCCCCC] hover:text-[#D9534F] transition-colors p-1"
-                      >
-                        <Trash2 className="w-3.5 h-3.5" />
-                      </button>
-                    </div>
-                  </div>
-                ))}
-              </div>
-            )}
-          </div>
-        )}
+          );
+        })}
       </div>
     </div>
   );

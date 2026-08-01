@@ -14,7 +14,7 @@ export default function TopNav() {
         <div className="flex items-center space-x-4 sm:space-x-8">
           <Link href="/" className="flex items-center">
             <Video className="w-5 h-5 text-[#2C4A73] mr-2" />
-            <span className="font-bold text-[#333333] tracking-wide text-sm">動画添削AIシステム</span>
+            <span className="font-bold text-[#333333] tracking-wide text-sm">動画制作チェックツール</span>
           </Link>
           
           <nav className="flex space-x-1">
@@ -46,7 +46,7 @@ export default function TopNav() {
         </div>
         
         <div className="hidden sm:block text-xs text-[#999999] font-medium border border-[#E5E5E5] px-2 py-1 rounded">
-          CS担当者用ツール
+          制作者用セルフチェック
         </div>
       </div>
     </header>

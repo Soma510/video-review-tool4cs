@@ -6,8 +6,8 @@ import TopNav from "@/components/layout/TopNav";
 const notoSansJP = Noto_Sans_JP({ subsets: ["latin"], weight: ["400", "500", "700"] });
 
 export const metadata: Metadata = {
-  title: "動画添削AIシステム",
-  description: "AIを活用したショート動画の添削・フィードバックシステム",
+  title: "動画制作チェックツール",
+  description: "AIでショート動画をセルフチェックするツール",
 };
 
 export default function RootLayout({
