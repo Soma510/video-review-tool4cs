@@ -8,6 +8,7 @@ import io
 import re
 import hashlib
 from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor
 from fastapi import FastAPI, UploadFile, Form, File, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydub import AudioSegment
@@ -15,9 +16,12 @@ from pydub.silence import detect_silence
 from google import genai
 from typing import List, Optional
 
-from prompt import DEFAULT_PROMPT_JA
+from layout_check import LAYOUT_PLACEHOLDER, analyze_layout
+from prompt import DEFAULT_PROMPT_JA, LAYOUT_ISSUES_BLOCK_JA
 
 app = FastAPI(title="Video Review API")
+
+GEMINI_MODEL = "gemini-3.5-flash"
 
 # 許可するオリジンは環境変数 ALLOWED_ORIGINS（カンマ区切り）で絞り込める。
 # 未設定の場合は従来どおり全許可（ローカル開発・検証用）。
@@ -93,6 +97,11 @@ def resolve_fps(raw) -> float:
         print(f"[fps] {value} は許容範囲({MIN_FPS}〜{MAX_FPS})外です。{clamped} に丸めました。")
         return clamped
     return value
+
+
+def _form_flag(raw) -> bool:
+    """フォームで渡されたON/OFF（"1" / "true" など）を真偽値にする。"""
+    return str(raw or "").strip().lower() in ("1", "true", "on", "yes")
 
 
 def summarize_usage(response, label: str) -> dict:
@@ -328,6 +337,9 @@ async def analyze_video(
     prompt_ja: str = Form(None),
     spreadsheet_url: str = Form(None),
     fps: str = Form(None),
+    check_black_bars: str = Form(None),
+    check_dead_zone: str = Form(None),
+    layout_debug: str = Form(None),
 ):
     try:
         ng_words_list = json.loads(ng_words)
@@ -360,8 +372,18 @@ async def analyze_video(
     use_inline = video_size_mb < INLINE_THRESHOLD_MB
 
     try:
-        # 1. 音声解析（ジェットカット検出）
-        audio_issues = detect_jetcut_issues(tmp_path)
+        # 1. 音声解析（ジェットカット検出）と、画角・デッドゾーンの検出を並行して行う
+        #    （どちらもffmpegでのデコードが中心なので、待ち時間を積み重ねないため）
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            audio_future = pool.submit(detect_jetcut_issues, tmp_path)
+            layout_future = pool.submit(
+                analyze_layout, tmp_path, client, GEMINI_MODEL,
+                _form_flag(check_black_bars), _form_flag(check_dead_zone), _form_flag(layout_debug),
+                summarize_usage,
+            )
+            audio_issues = audio_future.result()
+            layout = layout_future.result()
+        print(f"[layout] 検出結果:\n{layout['issues_text']}")
         audio_issues_text = "\n".join(audio_issues) if audio_issues else "無音区間は検出されませんでした。"
         # pydubによる無音区間の実測結果。Geminiが本当に音声を聞けているかを
         # 検証する際の「正解データ」として参照する。
@@ -403,8 +425,8 @@ async def analyze_video(
             "Translate the following video review instruction prompt from Japanese to English. "
             "Ensure that all nuances, formatting constraints, and strict instructions are perfectly preserved. "
             "CRITICAL - PLACEHOLDER PRESERVATION: The text contains literal placeholder tokens written "
-            "exactly as {ng_words_list}, {audio_issues_text}, and {call_to_action_list}. "
-            "You MUST output these three tokens verbatim and unchanged (same ASCII characters, same curly "
+            "exactly as {ng_words_list}, {audio_issues_text}, {call_to_action_list}, and {layout_issues_text}. "
+            "You MUST output these tokens verbatim and unchanged (same ASCII characters, same curly "
             "braces). Do NOT translate, rename, reformat, or remove them, and do NOT add or remove the braces. "
             "They are substituted programmatically AFTER translation. "
             "Any Japanese text that will later appear inside these placeholders (e.g. on-screen telop NG words "
@@ -431,7 +453,7 @@ async def analyze_video(
         else:
             print("[translation] Cache MISS — プロンプトを英訳します。")
             translation_response = client.models.generate_content(
-                model='gemini-3.5-flash',
+                model=GEMINI_MODEL,
                 contents=[translation_instruction + "\n\n---\n\n" + base_prompt]
             )
             prompt_en = translation_response.text.strip()
@@ -450,6 +472,13 @@ async def analyze_video(
         prompt_en = prompt_en.replace("{ng_words_list}", str(ng_words_list))
         prompt_en = prompt_en.replace("{audio_issues_text}", audio_issues_text)
         prompt_en = prompt_en.replace("{call_to_action_list}", call_to_action_text)
+        if LAYOUT_PLACEHOLDER in prompt_en:
+            prompt_en = prompt_en.replace(LAYOUT_PLACEHOLDER, layout["issues_text"])
+        elif layout["enabled"]["black_bars"] or layout["enabled"]["dead_zone"]:
+            # 設定画面で保存済みの古いプロンプトには {layout_issues_text} が無い。これを必須扱いに
+            # すると翻訳結果が黙って日本語テンプレートにフォールバックし、検出結果が捨てられて
+            # しまうため、必須にはせず、検出結果の節を末尾に足す。
+            prompt_en += "\n\n" + LAYOUT_ISSUES_BLOCK_JA.replace(LAYOUT_PLACEHOLDER, layout["issues_text"])
 
         from google.genai import types
 
@@ -484,7 +513,7 @@ async def analyze_video(
             )
 
         response = client.models.generate_content(
-            model='gemini-3.5-flash',
+            model=GEMINI_MODEL,
             contents=types.Content(parts=[video_part, types.Part(text=prompt_en)]),
             config=gen_config
         )
@@ -492,13 +521,16 @@ async def analyze_video(
         feedback_text = response.text.strip()
         analysis_usage = summarize_usage(response, "analysis")
 
-        # 1本あたりの実測値。translation（プロンプト英訳）とanalysis（動画解析）の合計。
-        total_tokens = translation_usage["total"] + analysis_usage["total"]
+        layout_usage = layout["usage"] or {
+            "label": "layout", "prompt": 0, "output": 0, "thoughts": 0, "total": 0, "by_modality": {},
+        }
+        # 1本あたりの実測値。translation（プロンプト英訳）・analysis（動画解析）・layout（テロップ位置の検出）の合計。
+        total_tokens = translation_usage["total"] + analysis_usage["total"] + layout_usage["total"]
         print(
             f"[usage:TOTAL] file={video.filename!r} size={video_size_mb:.1f}MB "
             f"mode={'inline' if use_inline else 'file_api'} fps={fps_value} "
             f"total={total_tokens:,} tokens "
-            f"(translation={translation_usage['total']:,} + analysis={analysis_usage['total']:,})"
+            f"(translation={translation_usage['total']:,} + analysis={analysis_usage['total']:,} + layout={layout_usage['total']:,})"
         )
 
         return {
@@ -511,10 +543,24 @@ async def analyze_video(
                 "count": len(call_to_action["actions"]),
                 "reason": call_to_action["reason"],
             },
+            # 画角・デッドゾーンを判定できたか。判定できなかった場合に黙って省略せず、画面で気づけるようにする。
+            "layout": {
+                "enabled": layout["enabled"],
+                "ok": layout["ok"],
+                "reason": layout["reason"],
+                "method": layout["method"],
+                "aspect_issue": layout["aspect_issue"],
+                "black_bar_count": len(layout["black_bar_issues"]),
+                "dead_zone_ok": layout["dead_zone_ok"],
+                "dead_zone_reason": layout["dead_zone_reason"],
+                "dead_zone_count": len(layout["dead_zone_issues"]),
+                "debug_images": layout["debug_images"],
+            },
             "usage": {
                 "total_tokens": total_tokens,
                 "translation": translation_usage,
                 "analysis": analysis_usage,
+                "layout": layout_usage,
                 "video_size_mb": round(video_size_mb, 1),
                 "mode": "inline" if use_inline else "file_api",
                 "fps": fps_value,

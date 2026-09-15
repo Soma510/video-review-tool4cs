@@ -12,6 +12,7 @@ interface UsageInfo {
   mode: string;
   fps: number;
   translation: { total: number };
+  layout?: { total: number };
   analysis: {
     total: number;
     prompt: number;
@@ -28,6 +29,24 @@ interface CallToActionInfo {
   reason: string;
 }
 
+/** 画角・デッドゾーンのチェック結果（判定できなかった理由も含む） */
+interface LayoutInfo {
+  enabled: { black_bars: boolean; dead_zone: boolean };
+  ok: boolean;
+  reason: string;
+  aspect_issue: boolean;
+  black_bar_count: number;
+  dead_zone_ok: boolean;
+  dead_zone_reason: string;
+  dead_zone_count: number;
+}
+
+/** 判定根拠の画像（検証用）。容量が大きいので保存しない */
+interface DebugImage {
+  label: string;
+  image: string;
+}
+
 interface ReviewItem {
   id: string;
   fileName: string;
@@ -37,6 +56,8 @@ interface ReviewItem {
   timestamp: string;
   usage?: UsageInfo;
   callToAction?: CallToActionInfo;
+  layout?: LayoutInfo;
+  layoutDebugImages?: DebugImage[];
 }
 
 // チェック結果は完了時点で自動保存され、この1つのキーだけで管理する。
@@ -46,6 +67,9 @@ const REVIEWS_KEY = "reviews";
 const LEGACY_ACTIVE_KEY = "active_reviews";
 const LEGACY_HISTORY_KEY = "review_history";
 const MAX_REVIEWS = 50;
+
+// 設定画面でONにした画角・デッドゾーンのチェック（値は "1" / "0"）
+const LAYOUT_FLAG_KEYS = ["check_black_bars", "check_dead_zone", "layout_debug"] as const;
 
 const INTERRUPTED_MESSAGE =
   "【エラー】画面が切り替わったため通信が中断されました。再度アップロードしてください。";
@@ -64,6 +88,16 @@ function normalize(items: ReviewItem[]): ReviewItem[] {
     );
   }
   return result;
+}
+
+/** 画角・デッドゾーンを判定できなかった場合の見出しと理由。問題なく判定できていれば null。 */
+function layoutWarningOf(layout?: LayoutInfo): { title: string; reason: string } | null {
+  if (!layout || !(layout.enabled.black_bars || layout.enabled.dead_zone)) return null;
+  if (!layout.ok) return { title: "画角・デッドゾーンをチェックできませんでした", reason: layout.reason };
+  if (layout.enabled.dead_zone && !layout.dead_zone_ok) {
+    return { title: "デッドゾーンをチェックできませんでした", reason: layout.dead_zone_reason };
+  }
+  return null;
 }
 
 function loadReviews(): ReviewItem[] {
@@ -114,7 +148,8 @@ export default function DashboardPage() {
     // 完了時点で保存されるため、利用者が保存操作を行う必要はない。
     if (!hydrated) return;
     try {
-      localStorage.setItem(REVIEWS_KEY, JSON.stringify(reviews));
+      // 判定根拠の画像はlocalStorage（上限5MB前後）をすぐに圧迫するため、保存対象から外す
+      localStorage.setItem(REVIEWS_KEY, JSON.stringify(reviews.map(r => ({ ...r, layoutDebugImages: undefined }))));
     } catch (e) {
       console.error("Failed to save reviews", e);
     }
@@ -172,6 +207,9 @@ export default function DashboardPage() {
       if (fps) {
         formData.append("fps", fps);
       }
+      for (const key of LAYOUT_FLAG_KEYS) {
+        if (localStorage.getItem(key) === "1") formData.append(key, "1");
+      }
 
       const response = await fetch(`${getApiUrl()}/analyze`, {
         method: "POST",
@@ -190,12 +228,17 @@ export default function DashboardPage() {
 
       const data = await response.json();
 
+      // 判定根拠の画像は表示用に分けて持ち、保存するチェック結果には含めない
+      const { debug_images: debugImages, ...layout } = data.layout ?? {};
+
       // 完了した時点で自動保存される（保存用effectが走る）
       patchReview(newItem.id, {
         status: "done",
         feedback: data.feedback,
         usage: data.usage,
         callToAction: data.call_to_action,
+        layout: data.layout ? layout : undefined,
+        layoutDebugImages: debugImages?.length ? debugImages : undefined,
       });
     } catch (error: unknown) {
       const message = error instanceof Error ? error.message : String(error);
@@ -264,6 +307,7 @@ export default function DashboardPage() {
           // 既定では最新の1件だけ開いた状態にし、それ以外は折りたたむ
           const isExpanded = expandedOverride[item.id] ?? index === 0;
           const collapsible = item.status === "done";
+          const layoutWarning = layoutWarningOf(item.layout);
 
           return (
             <div key={item.id} className="bg-white rounded border border-[#E5E5E5] shadow-sm overflow-hidden">
@@ -342,6 +386,18 @@ export default function DashboardPage() {
                           </p>
                         </div>
                       )}
+                      {layoutWarning && (
+                        <div className="mb-3 bg-[#FFF8E1] border-l-4 border-[#E0A800] p-3 rounded text-xs">
+                          <div className="font-bold text-[#333333] mb-1 flex items-center">
+                            <AlertTriangle className="w-3.5 h-3.5 mr-1.5 text-[#E0A800]" />
+                            {layoutWarning.title}
+                          </div>
+                          <p className="text-[#4A4A4A]">{layoutWarning.reason}</p>
+                          <p className="text-[#856404] mt-1">
+                            この動画では該当する項目の指摘が出ていませんが、問題が無いという意味ではありません。
+                          </p>
+                        </div>
+                      )}
                       <textarea
                         value={item.feedback}
                         onChange={(e) => patchReview(item.id, { feedback: e.target.value })}
@@ -351,7 +407,8 @@ export default function DashboardPage() {
                       {item.usage && (
                         <div className="mt-3 text-xs text-[#999999] font-mono border-t border-[#E5E5E5] pt-2 leading-relaxed">
                           消費トークン <span className="text-[#666666] font-bold">{item.usage.total_tokens.toLocaleString()}</span>
-                          {"　"}（動画解析 {item.usage.analysis.total.toLocaleString()} ／ プロンプト英訳 {item.usage.translation.total.toLocaleString()}）
+                          {"　"}（動画解析 {item.usage.analysis.total.toLocaleString()} ／ プロンプト英訳 {item.usage.translation.total.toLocaleString()}
+                          {item.usage.layout && item.usage.layout.total > 0 ? ` ／ テロップ位置 ${item.usage.layout.total.toLocaleString()}` : ""}）
                           <br />
                           内訳: 入力 {item.usage.analysis.prompt.toLocaleString()}
                           {Object.entries(item.usage.analysis.by_modality).length > 0 && (
@@ -361,6 +418,28 @@ export default function DashboardPage() {
                           {" ／ 出力 "}{item.usage.analysis.output.toLocaleString()}
                           {"　"}{item.usage.video_size_mb}MB・{item.usage.mode}
                           {item.usage.fps ? `・${item.usage.fps}fps` : ""}
+                        </div>
+                      )}
+                      {item.layoutDebugImages && item.layoutDebugImages.length > 0 && (
+                        <div className="mt-3 border-t border-[#E5E5E5] pt-3">
+                          <p className="text-xs font-bold text-[#666666] mb-1">判定根拠の画像（検証用・保存されません）</p>
+                          <p className="text-[11px] text-[#999999] mb-2">
+                            水色の枠＝検出したプレビュー枠／薄い赤＝デッドゾーン／ピンクの線＝黒帯の境目／黄色の枠＝テロップ（赤い枠はデッドゾーン違反）／灰色の枠＝CapCutのプレビュー領域
+                          </p>
+                          <div className="grid grid-cols-2 sm:grid-cols-3 gap-3">
+                            {item.layoutDebugImages.map((shot, i) => (
+                              <figure key={i} className="text-[11px] text-[#666666]">
+                                {/* 解析結果のbase64画像をそのまま表示するため、next/imageの最適化は使わない */}
+                                {/* eslint-disable-next-line @next/next/no-img-element */}
+                                <img
+                                  src={`data:image/jpeg;base64,${shot.image}`}
+                                  alt={shot.label}
+                                  className="w-full rounded border border-[#E5E5E5]"
+                                />
+                                <figcaption className="mt-1">{shot.label}</figcaption>
+                              </figure>
+                            ))}
+                          </div>
                         </div>
                       )}
                     </>

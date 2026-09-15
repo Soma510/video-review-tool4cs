@@ -1,7 +1,7 @@
 "use client";
 
 import { useState, useEffect } from "react";
-import { KeyRound, ShieldAlert, Save, Trash2, Plus, CheckCircle2, FileText, RotateCcw, Loader2, Film } from "lucide-react";
+import { KeyRound, ShieldAlert, Save, Trash2, Plus, CheckCircle2, FileText, RotateCcw, Loader2, Film, Crop } from "lucide-react";
 import { fetchDefaultPrompt, checkCallToActionList, type CallToActionCheck } from "@/lib/api";
 import clsx from "clsx";
 
@@ -15,6 +15,13 @@ const FPS_OPTIONS = [
   { value: "1", label: "1 fps（1000ms間隔）", detail: "コスト約46%減。Geminiの既定値ですが、表示の短いテロップを丸ごと取りこぼす恐れがあります。" },
 ];
 
+/** 画角・デッドゾーンのチェック（試験運用）。実際の録画で精度を確認するまで、初期状態はOFF。 */
+const LAYOUT_OPTIONS = [
+  { key: "check_black_bars", label: "黒帯（縦横比のミス）をチェックする", detail: "素材がキャンバスに合っておらず、上下・左右に黒い帯が出ている箇所を指摘します。画像解析だけで判定するため、APIの利用は増えません。" },
+  { key: "check_dead_zone", label: "デッドゾーンへのテロップ配置をチェックする", detail: "TikTok・InstagramのUIに隠れる位置に、テロップの面積の2割以上が入っている箇所を指摘します。テロップの位置をAIで読み取るため、1回のチェックにつきAPIの呼び出しが1回増えます（有料枠の場合は約3〜6円）。" },
+  { key: "layout_debug", label: "判定根拠の画像を表示する（検証用）", detail: "検出したプレビュー枠・黒帯の境目・テロップの枠を描き込んだ画像を、結果の下に表示します。画像は保存されません。" },
+];
+
 export default function SettingsPage() {
   const [apiKey, setApiKey] = useState("");
   const [spreadsheetUrl, setSpreadsheetUrl] = useState("");
@@ -22,6 +29,7 @@ export default function SettingsPage() {
   const [newWord, setNewWord] = useState("");
   const [promptJa, setPromptJa] = useState("");
   const [fps, setFps] = useState(DEFAULT_FPS);
+  const [layoutChecks, setLayoutChecks] = useState<Record<string, boolean>>({});
   const [ctaCheck, setCtaCheck] = useState<CallToActionCheck | null>(null);
   const [ctaChecking, setCtaChecking] = useState(false);
   const [promptLoading, setPromptLoading] = useState(false);
@@ -58,6 +66,7 @@ export default function SettingsPage() {
     const savedFps = localStorage.getItem("video_fps");
 
     if (savedFps && FPS_OPTIONS.some(o => o.value === savedFps)) setFps(savedFps);
+    setLayoutChecks(Object.fromEntries(LAYOUT_OPTIONS.map(o => [o.key, localStorage.getItem(o.key) === "1"])));
     if (savedApiKey) setApiKey(savedApiKey);
     if (savedSpreadsheetUrl) setSpreadsheetUrl(savedSpreadsheetUrl);
     if (savedPromptJa) {
@@ -119,6 +128,12 @@ export default function SettingsPage() {
   const handleSelectFps = (value: string) => {
     setFps(value);
     localStorage.setItem("video_fps", value);
+    showSavedNotification();
+  };
+
+  const handleToggleLayoutCheck = (key: string, enabled: boolean) => {
+    setLayoutChecks(prev => ({ ...prev, [key]: enabled }));
+    localStorage.setItem(key, enabled ? "1" : "0");
     showSavedNotification();
   };
 
@@ -326,6 +341,42 @@ export default function SettingsPage() {
           </div>
         </div>
 
+        {/* Layout Check Section */}
+        <div className="bg-white rounded border border-[#E5E5E5] p-4 sm:p-6 shadow-sm">
+          <div className="flex items-center mb-4">
+            <Crop className="w-5 h-5 text-[#2C4A73] mr-2" />
+            <h2 className="text-sm font-bold text-[#333333]">画角・デッドゾーンのチェック（試験運用）</h2>
+          </div>
+          <p className="text-xs text-[#666666] mb-4">
+            画面録画の中からCapCutのプレビュー枠を見つけて、黒帯やテロップの位置を判定します。実際の動画で精度を確認するまで、初期状態はOFFにしています。<br />
+            デッドゾーン（1080×1920基準）：上250px・左右120px・下480px・右下の縦長部分（下から1080px × 右端から300px）
+          </p>
+          <div className="space-y-2">
+            {LAYOUT_OPTIONS.map(option => (
+              <label
+                key={option.key}
+                className={clsx(
+                  "flex items-start p-3 rounded border cursor-pointer transition-colors",
+                  layoutChecks[option.key]
+                    ? "border-[#2C4A73] bg-[#F4F6F8]"
+                    : "border-[#E5E5E5] bg-[#FAF9F6] hover:bg-[#F5F4F0]"
+                )}
+              >
+                <input
+                  type="checkbox"
+                  checked={!!layoutChecks[option.key]}
+                  onChange={(e) => handleToggleLayoutCheck(option.key, e.target.checked)}
+                  className="mt-0.5 mr-3 accent-[#2C4A73]"
+                />
+                <span className="flex-1">
+                  <span className="block text-sm font-bold text-[#333333]">{option.label}</span>
+                  <span className="block text-xs text-[#666666] mt-0.5">{option.detail}</span>
+                </span>
+              </label>
+            ))}
+          </div>
+        </div>
+
         {/* Prompt Section */}
         <div className="bg-white rounded border border-[#E5E5E5] p-4 sm:p-6 shadow-sm">
           <div className="flex items-center mb-4">
@@ -334,7 +385,7 @@ export default function SettingsPage() {
           </div>
           <p className="text-xs text-[#666666] mb-4">
             AIへの指示内容を日本語で編集できます。ここに入力された内容は、分析実行時に自動的に最適な英語に翻訳されてAIに渡されます。<br/>
-            ※ <code>{'{ng_words_list}'}</code>、<code>{'{audio_issues_text}'}</code>、<code>{'{call_to_action_list}'}</code> の部分は、実行時に実際の内容に自動置換されます。そのまま残してください。
+            ※ <code>{'{ng_words_list}'}</code>、<code>{'{audio_issues_text}'}</code>、<code>{'{call_to_action_list}'}</code>、<code>{'{layout_issues_text}'}</code> の部分は、実行時に実際の内容に自動置換されます。そのまま残してください。
           </p>
           {promptError && (
             <div className="mb-3 bg-[#FDF2F2] border-l-4 border-[#D9534F] px-3 py-2 rounded text-xs text-[#333333] whitespace-pre-wrap">

@@ -4,3 +4,5 @@ python-multipart
 pydub
 google-genai>=2.6.0
 python-dotenv
+numpy
+Pillow
